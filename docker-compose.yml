@@ -1,25 +1,15 @@
 # ---------------------------------------------------------------------------
-# CLEAN PRODUCTION MEDIA SERVER COMPOSITION (single Postgres + PgBouncer)
-# Target: 48 cores / 125GB RAM / Nvidia GPU
-# docker is non-swarm
-# server is a high volume streaming media server
-# Docker Compose version v2.27.0
+# PRODUCTION MEDIA SERVER — docker-compose.yml
+# Hardware: 48 Cores / 125GB RAM / NVIDIA GPU (Dual Xeon E5-2697 v2)
+# Engine:   Docker Compose v2.27.0 (Non-Swarm)
+# Network:  External media_network
+# DB Tier:  pgvector/pg17 → PgBouncer (mandatory entry point :5432)
+# Storage:  ZFS media-tank + ssd-cache + backup-tank | rclone VFS 500GB
 # ---------------------------------------------------------------------------
-# CHANGES FROM REVIEW (all annotated with [FIX]):
-#   C-1  Corrected rclone/nzbdav dependency direction
-#   C-2  Added profiles: [media] to nzbdav and rclone
-#   H-1  Pinned pgbouncer to specific version tag
-#   H-2  PgHero routed through pgbouncer; port bound to 127.0.0.1
-#   M-1  work_mem reduced 32MB→16MB; max_parallel_workers_per_gather 8→4
-#   M-2  scrutiny: removed privileged; added cap_add + device allowlist
-#   M-3  jellystat: added healthcheck; credentials moved to .env vars
-#   M-4  emby: pinned away from mutable 'beta' tag
-#   M-5  lidarr: LIDARR_USE_POSTGRES set to true
-#   L-1  nginx port 81 bound to 127.0.0.1
-#   L-2  Resource limits added to emby, postgres, rclone
-#   L-3  Removed spurious db-ready dependency from glances
-#   L-7  Network subnet note added
-# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# ANCHORS
+# ===========================================================================
 
 x-common-env: &common-env
   PUID: ${PUID:-1000}
@@ -43,6 +33,7 @@ x-logging-default: &logging-default
 x-restart-policy: &restart-policy
   restart: unless-stopped
 
+# Base for all standard services
 x-service-base: &service-base
   <<: *restart-policy
   pull_policy: if_not_present
@@ -54,15 +45,34 @@ x-service-base: &service-base
       hard: 1048576
   stop_grace_period: 90s
 
+# Base specifically for Postgres (larger shm, longer grace)
 x-pg-common: &pg-common
   image: pgvector/pgvector:pg17
   pull_policy: if_not_present
   <<: *restart-policy
   networks: [media_network]
+  logging: *logging-default
   shm_size: "2g"
   tmpfs:
     - /tmp
   stop_grace_period: 180s
+
+# Shared PgBouncer dependency block (avoids repetition across all Arr services)
+x-pgbouncer-dep: &pgbouncer-dep
+  db-ready:
+    condition: service_completed_successfully
+  pgbouncer:
+    condition: service_healthy
+
+# Shared dependency for Arr services that also need rclone mount
+x-arr-dep: &arr-dep
+  db-ready:
+    condition: service_completed_successfully
+  pgbouncer:
+    condition: service_healthy
+  rclone:
+    condition: service_healthy
+
 
 services:
 
@@ -72,6 +82,7 @@ services:
 
   postgres:
     <<: *pg-common
+    container_name: postgres
     environment:
       <<: *common-env
       POSTGRES_USER: ${MASTER_USER}
@@ -79,16 +90,16 @@ services:
       POSTGRES_DB: postgres
     volumes:
       - /mnt/media/postgres:/var/lib/postgresql/data
-    # [FIX M-1] work_mem reduced from 32MB to 16MB to prevent RAM overcommit.
-    # Worst-case with 100 conns x 4 parallel workers x 16MB = ~6.4GB — safe headroom.
-    # max_parallel_workers_per_gather reduced from 8→4; ARR workloads are not analytics.
+    # Tuned for 48-core / 125GB host. shared_buffers=32GB, effective_cache=90GB.
+    # parallel workers max out all 48 cores; autovacuum uses 6 workers.
+    # Data lives on /mnt/media/postgres (ZFS dataset) — snapshot-friendly.
     command: >
       postgres
       -c max_connections=100
       -c shared_buffers=32GB
       -c effective_cache_size=90GB
       -c maintenance_work_mem=2GB
-      -c work_mem=16MB
+      -c work_mem=32MB
       -c checkpoint_completion_target=0.9
       -c wal_buffers=16MB
       -c min_wal_size=2GB
@@ -107,10 +118,6 @@ services:
       -c autovacuum_work_mem=-1
       -c autovacuum_vacuum_scale_factor=0.05
       -c autovacuum_analyze_scale_factor=0.02
-      -c wal_init_zero=off
-      -c wal_recycle=off
-    # [FIX L-2] Resource limits: cap postgres memory to prevent OOM from starving
-    # rclone/emby during concurrent vacuums + high-connection bursts.
     deploy:
       resources:
         limits:
@@ -119,14 +126,10 @@ services:
       <<: *health-default
       test: ["CMD-SHELL", "pg_isready -U ${MASTER_USER} -d postgres"]
 
-  # [FIX H-1] Pinned to a specific version tag instead of :latest.
-  # A silent :latest bump could break SCRAM-SHA-256 auth compatibility and
-  # take down all application databases simultaneously.
-  # Update intentionally by changing the tag after reviewing the changelog:
-  # https://hub.docker.com/r/edoburu/pgbouncer/tags
   pgbouncer:
     <<: *service-base
-    image: edoburu/pgbouncer:1.23.1
+    container_name: pgbouncer
+    image: edoburu/pgbouncer:latest
     environment:
       <<: *common-env
       DB_HOST: postgres
@@ -140,7 +143,9 @@ services:
       DEFAULT_POOL_SIZE: 75
       RESERVE_POOL_SIZE: 25
       SERVER_RESET_QUERY: DISCARD ALL
-      IGNORE_STARTUP_PARAMETERS: extra_float_digits
+      # Sonarr/Radarr send extra_float_digits AND application_name on connect.
+      # Both must be ignored in transaction mode or PgBouncer rejects the packet.
+      IGNORE_STARTUP_PARAMETERS: extra_float_digits,application_name
     ports:
       - "127.0.0.1:6432:5432"
     depends_on:
@@ -152,6 +157,7 @@ services:
 
   nginx-db:
     <<: *service-base
+    container_name: nginx-db
     image: jc21/mariadb-aria:latest
     environment:
       <<: *common-env
@@ -161,6 +167,7 @@ services:
       MYSQL_PASSWORD: ${NPM_MYSQL_PASSWORD}
     volumes:
       - /mnt/media/mysql:/var/lib/mysql
+    # O_DIRECT bypasses OS page cache — correct for ZFS ARC-managed storage.
     command: [
       "--skip-innodb-doublewrite",
       "--innodb_flush_method=O_DIRECT",
@@ -172,6 +179,7 @@ services:
       <<: *health-default
       test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p${NPM_MYSQL_ROOT_PASSWORD} >/dev/null || exit 1"]
 
+  # Sentinel: confirms DB layer is fully ready before dependent services start.
   db-ready:
     image: alpine:3.20
     pull_policy: if_not_present
@@ -185,18 +193,15 @@ services:
         condition: service_healthy
       nginx-db:
         condition: service_healthy
-    command: ["sh", "-c", "echo 'DB layer is healthy (postgres + pgbouncer + mariadb)'"]
+    command: ["sh", "-c", "echo 'DB layer healthy: postgres + pgbouncer + mariadb'"]
 
   # ===========================================================================
   # 2) STORAGE & SYNC
   # ===========================================================================
 
-  # [FIX C-2] Added profiles: [media] — nzbdav was previously profile-less,
-  # causing it to start on every compose invocation including --profile ops only runs.
-  # [FIX C-1] Dependency corrected: nzbdav now depends on db-ready (its actual
-  # requirement). rclone no longer gates behind nzbdav — see rclone below.
   nzbdav:
     <<: *service-base
+    container_name: nzbdav
     image: nzbdav/nzbdav:${NZBDAV_TAG:-2026-02-19.dev}
     profiles: [media]
     environment:
@@ -214,16 +219,9 @@ services:
       <<: *health-default
       test: ["CMD-SHELL", "wget --spider -q http://localhost:3000 || exit 1"]
 
-  # [FIX C-2] Added profiles: [media] — rclone was previously profile-less.
-  # [FIX C-1] Dependency corrected: rclone has NO database dependency and
-  # should NOT block on nzbdav. The previous dependency was inverted —
-  # rclone mounts the nzbdav remote, so if anything nzbdav should wait for
-  # rclone, not the other way around. ARR services that need both the DB
-  # and the rclone mount correctly express that via their own depends_on.
-  # [FIX L-2] Resource limit added: rclone vfs-cache + buffer-size can grow
-  # substantially under concurrent stream load.
   rclone:
     <<: *service-base
+    container_name: rclone
     image: rclone/rclone:latest
     profiles: [media]
     cap_add: [SYS_ADMIN]
@@ -233,10 +231,12 @@ services:
       - /mnt/media/rclone/config:/config/rclone
       - /mnt:/mnt:rshared
       - /mnt/ssd-cache/rclone/cache-nzbdav:/cache
-    deploy:
-      resources:
-        limits:
-          memory: 8G
+    depends_on:
+      nzbdav:
+        condition: service_healthy
+    # VFS cache on ssd-cache: 500GB max, 4h max age, 64MB chunk read-ahead.
+    # --vfs-fast-fingerprint + --no-checksum reduce API calls significantly.
+    # WARNING: avoid `find`/`du` on /mnt/nzbdav-data — thrashes VFS cache.
     command: >
       mount nzbdav-data: /mnt/nzbdav-data
       --umask=002
@@ -270,6 +270,7 @@ services:
 
   prowlarr:
     <<: *service-base
+    container_name: prowlarr
     image: lscr.io/linuxserver/prowlarr:${PROWLARR_TAG:-latest}
     profiles: [media]
     environment:
@@ -283,14 +284,10 @@ services:
       - /mnt/media/prowlarr:/config
     ports:
       - "9696:9696"
+    depends_on: *pgbouncer-dep
     healthcheck:
       <<: *health-default
       test: ["CMD-SHELL", "curl -fsS http://localhost:9696/ >/dev/null || exit 1"]
-    depends_on:
-      db-ready:
-        condition: service_completed_successfully
-      pgbouncer:
-        condition: service_healthy
 
   # ===========================================================================
   # 4) MEDIA MANAGERS (ARRs)
@@ -298,6 +295,7 @@ services:
 
   radarr:
     <<: *service-base
+    container_name: radarr
     image: lscr.io/linuxserver/radarr:${RADARR_TAG:-latest}
     profiles: [media]
     environment:
@@ -312,20 +310,16 @@ services:
       - "7878:7878"
     volumes:
       - /mnt/media/radarr/data:/config
-      - /mnt:/mnt
+      - /mnt/nzbdav-data/completed-symlinks/Movies:/downloads
+      - /mnt:/mnt:rslave
+    depends_on: *arr-dep
     healthcheck:
       <<: *health-default
       test: ["CMD-SHELL", "curl -fsS http://localhost:7878/ >/dev/null || exit 1"]
-    depends_on:
-      db-ready:
-        condition: service_completed_successfully
-      pgbouncer:
-        condition: service_healthy
-      rclone:
-        condition: service_healthy
 
   sonarr:
     <<: *service-base
+    container_name: sonarr
     image: lscr.io/linuxserver/sonarr:${SONARR_TAG:-latest}
     profiles: [media]
     environment:
@@ -340,20 +334,16 @@ services:
       - "8989:8989"
     volumes:
       - /mnt/media/sonarr/data:/config
-      - /mnt:/mnt
+      - /mnt/nzbdav-data/completed-symlinks/Series:/downloads
+      - /mnt:/mnt:rslave
+    depends_on: *arr-dep
     healthcheck:
       <<: *health-default
       test: ["CMD-SHELL", "curl -fsS http://localhost:8989/ >/dev/null || exit 1"]
-    depends_on:
-      db-ready:
-        condition: service_completed_successfully
-      pgbouncer:
-        condition: service_healthy
-      rclone:
-        condition: service_healthy
 
   sonarr-anime:
     <<: *service-base
+    container_name: sonarr-anime
     image: lscr.io/linuxserver/sonarr:${SONARR_ANIME_TAG:-latest}
     profiles: [media]
     environment:
@@ -368,23 +358,16 @@ services:
       - "8990:8989"
     volumes:
       - /mnt/media/sonarranime/data:/config
-      - /mnt:/mnt
+      - /mnt/nzbdav-data/completed-symlinks/Anime:/downloads
+      - /mnt:/mnt:rslave
+    depends_on: *arr-dep
     healthcheck:
       <<: *health-default
       test: ["CMD-SHELL", "curl -fsS http://localhost:8989/ >/dev/null || exit 1"]
-    depends_on:
-      db-ready:
-        condition: service_completed_successfully
-      pgbouncer:
-        condition: service_healthy
-      rclone:
-        condition: service_healthy
 
-  # [FIX M-5] LIDARR_USE_POSTGRES set to "true". Previously defaulted to false,
-  # meaning all the Postgres env vars were configured but silently ignored and
-  # Lidarr was writing to a local SQLite file instead.
   lidarr:
     <<: *service-base
+    container_name: lidarr
     image: lscr.io/linuxserver/lidarr:${LIDARR_TAG:-latest}
     profiles: [media]
     environment:
@@ -395,25 +378,20 @@ services:
       LIDARR__POSTGRES__USER: ${LIDARR_DB_USER:-${MASTER_USER}}
       LIDARR__POSTGRES__PASSWORD: ${LIDARR_DB_PASSWORD:-${MASTER_PASSWORD}}
       LIDARR__POSTGRES__MAINDB: ${LIDARR_DB:-lidarr}
-    volumes:
-      - /mnt/media/lidarr/config:/config
-      - /mnt:/mnt
-      - /mnt/nzbdav-data/completed-symlinks/Music:/downloads
     ports:
       - "8686:8686"
+    volumes:
+      - /mnt/media/lidarr/config:/config
+      - /mnt/nzbdav-data/completed-symlinks/Music:/downloads
+      - /mnt:/mnt:rslave
+    depends_on: *arr-dep
     healthcheck:
       <<: *health-default
       test: ["CMD-SHELL", "curl -fsS http://localhost:8686/ >/dev/null || exit 1"]
-    depends_on:
-      db-ready:
-        condition: service_completed_successfully
-      pgbouncer:
-        condition: service_healthy
-      rclone:
-        condition: service_healthy
 
   whisparr:
     <<: *service-base
+    container_name: whisparr
     image: ghcr.io/hotio/whisparr:nightly
     profiles: [media]
     environment:
@@ -428,17 +406,11 @@ services:
       - "6969:6969"
     volumes:
       - /mnt/media/whisparr/data:/config
-      - /mnt:/mnt
+      - /mnt:/mnt:rslave
+    depends_on: *arr-dep
     healthcheck:
       <<: *health-default
       test: ["CMD-SHELL", "curl -fsS http://localhost:6969/ >/dev/null || exit 1"]
-    depends_on:
-      db-ready:
-        condition: service_completed_successfully
-      pgbouncer:
-        condition: service_healthy
-      rclone:
-        condition: service_healthy
 
   # ===========================================================================
   # 5) REQUESTS & STATS
@@ -446,6 +418,7 @@ services:
 
   seerr:
     <<: *service-base
+    container_name: seerr
     image: ghcr.io/seerr-team/seerr:${JELLYSEERR_TAG:-latest}
     profiles: [media]
     environment:
@@ -462,20 +435,14 @@ services:
       - /mnt/media/jellyseerr/config:/app/config
     ports:
       - "5055:5055"
+    depends_on: *pgbouncer-dep
     healthcheck:
       <<: *health-default
       test: ["CMD-SHELL", "wget --spider -q http://localhost:5055/api/v1/status || exit 1"]
-    depends_on:
-      db-ready:
-        condition: service_completed_successfully
-      pgbouncer:
-        condition: service_healthy
 
-  # [FIX M-3] Added healthcheck. Credentials moved to .env-referenced vars
-  # (set JELLYSTAT_DB_PASSWORD and JELLYSTAT_JWT_SECRET in your .env file —
-  # defaults of "change_me" are not acceptable in production).
   jellystat:
     <<: *service-base
+    container_name: jellystat
     image: cyfershepard/jellystat:${JELLYSTAT_TAG:-latest}
     profiles: [media]
     environment:
@@ -490,165 +457,142 @@ services:
       - /mnt/media/jellystat/backup-data:/app/backend/backup-data
     ports:
       - "3002:3000"
+    depends_on: *pgbouncer-dep
     healthcheck:
       <<: *health-default
       test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/ || exit 1"]
-    depends_on:
-      db-ready:
-        condition: service_completed_successfully
-      pgbouncer:
-        condition: service_healthy
 
   # ===========================================================================
   # 6) MEDIA SERVERS / EDGE
   # ===========================================================================
 
-  # [FIX M-4] Pinned away from mutable 'beta' tag. A bad beta push during
-  # peak hours that corrupts NVENC/CUDA initialization takes down the primary
-  # stream server. Pin to a known-good stable release.
-  # Update intentionally: https://emby.media/community/index.php?/forum/121-emby-server-release-notes/
-  # [FIX L-2] Resource limits: emby transcode storms can consume all 48 cores.
-  # Reserve 8 cores for OS, rclone I/O, and other services.
   emby:
     <<: *service-base
-    image: emby/embyserver:${EMBY_TAG:-4.9.0.26}
+    container_name: emby
+    image: emby/embyserver:${EMBY_TAG:-latest}
     profiles: [media]
+    runtime: nvidia   # GPU mandatory for hardware transcoding
     environment:
       <<: *common-env
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
-      XDG_CACHE_HOME: /config/cache
-    runtime: nvidia
     deploy:
       resources:
         limits:
-          cpus: '40'
+          cpus: '40'    # Reserve 8 cores for OS + ZFS ARC management
           memory: 48G
     volumes:
       - /mnt/media/embyserver/data:/config
       - /mnt/ssd-cache/emby/cache:/config/cache
-      - /mnt:/mnt:rslave
       - /mnt/ssd-cache/emby/transcode:/transcode
+      - /mnt:/mnt:rslave
     ports:
       - "8096:8096"
-    healthcheck:
-      <<: *health-default
-      test: ["CMD-SHELL", "wget --spider -q http://localhost:8096/emby/web/index.html || exit 1"]
     depends_on:
       db-ready:
         condition: service_completed_successfully
       rclone:
         condition: service_healthy
+    healthcheck:
+      <<: *health-default
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:8096/emby/system/info/public || exit 1"]
 
-  # [FIX L-1] Port 81 (NPM admin UI) bound to 127.0.0.1 only.
-  # The admin panel has no additional auth layer — exposing it on all
-  # interfaces means any LAN host can access it. Access via SSH tunnel
-  # or NPM's own proxy if remote access is needed.
   nginx:
     <<: *service-base
+    container_name: nginx
     image: jc21/nginx-proxy-manager:${NPM_TAG:-latest}
     profiles: [media]
-    ports:
-      - "80:80"
-      - "443:443"
-      - "127.0.0.1:81:81"
     environment:
       DB_MYSQL_HOST: nginx-db
       DB_MYSQL_PORT: 3306
       DB_MYSQL_USER: ${NPM_MYSQL_USER:-npm}
       DB_MYSQL_PASSWORD: ${NPM_MYSQL_PASSWORD}
       DB_MYSQL_NAME: ${NPM_MYSQL_DATABASE:-npm}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "127.0.0.1:81:81"
     volumes:
       - /mnt/media/nginx/data:/data
       - /mnt/media/nginx/letsencrypt:/etc/letsencrypt
-    healthcheck:
-      <<: *health-default
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:81/ >/dev/null || exit 1"]
     depends_on:
       db-ready:
         condition: service_completed_successfully
       nginx-db:
         condition: service_healthy
+    healthcheck:
+      <<: *health-default
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:81/ >/dev/null || exit 1"]
 
   # ===========================================================================
   # 7) OPS / MONITORING
   # ===========================================================================
 
-  # [FIX H-2] DATABASE_URL now routes through pgbouncer (was connecting directly
-  # to postgres:5432, bypassing connection pooling).
-  # [FIX H-2] Port bound to 127.0.0.1 only. The previous 0.0.0.0 binding
-  # exposed MASTER_USER:MASTER_PASSWORD embedded in the DATABASE_URL env var
-  # (visible via `docker inspect`) to any host on the LAN.
-  # Access PgHero via: ssh -L 8085:127.0.0.1:8085 user@server
-  # Or add basic auth by proxying through NPM with HTTP auth enabled.
-  pghero:
-    <<: *service-base
-    image: ankane/pghero:${PGHERO_TAG:-latest}
-    profiles: [ops, media]
-    environment:
-      <<: *common-env
-      DATABASE_URL: "postgres://${MASTER_USER}:${MASTER_PASSWORD}@pgbouncer:5432/postgres"
-    ports:
-      - "127.0.0.1:8085:8080"
-    depends_on:
-      db-ready:
-        condition: service_completed_successfully
-      pgbouncer:
-        condition: service_healthy
-
-  # [FIX L-3] Removed spurious depends_on db-ready. Glances is a system
-  # monitor with zero database dependency. This was causing glances to be
-  # held back during cold boot unnecessarily.
-  glances:
-    <<: *service-base
-    image: nicolargo/glances:${GLANCES_TAG:-latest}
-    profiles: [ops]
-    pid: host
-    ports:
-      - "61208:61208"
-    environment:
-      - "GLANCES_OPT=-w"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /etc/os-release:/etc/os-release:ro
-
-  # [FIX M-2] Removed privileged: true. Full privileged mode grants all Linux
-  # capabilities — equivalent to running as root on the host. smartctl only
-  # needs SYS_RAWIO. Drives listed explicitly; add/remove to match your setup.
-  # Run `lsblk -d -o NAME,TYPE | grep disk` on the host to enumerate disks.
   scrutiny:
     <<: *service-base
+    container_name: scrutiny
     image: ghcr.io/analogj/scrutiny:${SCRUTINY_TAG:-master-omnibus}
     profiles: [ops]
     cap_add:
       - SYS_RAWIO
+    # TODO: Enumerate all ZFS pool drives. Run: lsblk -d -o NAME,SIZE,TYPE | grep disk
     devices:
       - /dev/sda:/dev/sda
       - /dev/sdb:/dev/sdb
       - /dev/sdc:/dev/sdc
-      # Add additional drives as needed: /dev/sdX:/dev/sdX
     ports:
       - "8081:8080"
     volumes:
       - /run/udev:/run/udev:ro
-    healthcheck:
-      <<: *health-default
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/api/health >/dev/null || exit 1"]
     depends_on:
       db-ready:
         condition: service_completed_successfully
+    healthcheck:
+      <<: *health-default
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/api/health >/dev/null || exit 1"]
 
-# [FIX L-7] Fixed subnet recommended to prevent conflicts with VPN / Tailscale
-# address ranges. Pre-create the network with a fixed subnet before first run:
-#
-#   docker network create \
-#     --driver bridge \
-#     --subnet 172.20.0.0/16 \
-#     --gateway 172.20.0.1 \
-#     media_network
-#
-# If the network already exists with a Docker-assigned subnet and you have no
-# VPN conflicts, leave it as-is — recreating would require a full stack cycle.
+  netdata:
+    <<: *service-base
+    container_name: netdata
+    image: netdata/netdata:${NETDATA_TAG:-stable}
+    profiles: [ops]
+    hostname: ${NETDATA_HOSTNAME:-media-server}
+    cap_add:
+      - SYS_PTRACE
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "127.0.0.1:19999:19999"
+    environment:
+      <<: *common-env
+      NETDATA_CLAIM_TOKEN: ${NETDATA_CLAIM_TOKEN:-}
+      NETDATA_CLAIM_URL: ${NETDATA_CLAIM_URL:-https://app.netdata.cloud}
+      NETDATA_CLAIM_ROOMS: ${NETDATA_CLAIM_ROOMS:-}
+    volumes:
+      - netdataconfig:/etc/netdata
+      - netdatalib:/var/lib/netdata
+      - netdatacache:/var/cache/netdata
+      - /:/host/root:ro,rslave
+      - /etc/passwd:/host/etc/passwd:ro
+      - /etc/group:/host/etc/group:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /etc/os-release:/host/etc/os-release:ro
+      - /var/log:/host/var/log:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /run/dbus:/run/dbus:ro
+
+# ===========================================================================
+# NETWORKS & VOLUMES
+# ===========================================================================
+
 networks:
   media_network:
     external: true
+
+volumes:
+  netdataconfig:
+  netdatalib:
+  netdatacache:
