@@ -182,6 +182,7 @@ services:
   # Sentinel: confirms DB layer is fully ready before dependent services start.
   db-ready:
     image: alpine:3.20
+    container_name: db-ready
     pull_policy: if_not_present
     networks: [media_network]
     logging: *logging-default
@@ -219,6 +220,39 @@ services:
       <<: *health-default
       test: ["CMD-SHELL", "wget --spider -q http://localhost:3000 || exit 1"]
 
+  rclone-init:
+    image: alpine:3.20
+    container_name: rclone-init
+    pull_policy: if_not_present
+    networks: [media_network]
+    logging: *logging-default
+    restart: "no"
+    profiles: [media]
+    volumes:
+      - /mnt:/mnt:rshared
+    depends_on:
+      nzbdav:
+        condition: service_healthy
+    # Ensures /mnt/nzbdav-data is a clean, empty directory before rclone mounts.
+    # If a stale FUSE mount exists, rclone will fail with "mountpoint not empty".
+    # This init container forcefully clears any leftover state on every stack start.
+    command:
+      - sh
+      - -c
+      - |
+        MOUNT=/mnt/nzbdav-data
+        echo "Checking $$MOUNT before rclone mount..."
+        # Attempt lazy unmount in case a stale FUSE mount is still registered
+        umount -l "$$MOUNT" 2>/dev/null && echo "  Stale mount removed." || true
+        # Ensure the directory exists and is empty
+        mkdir -p "$$MOUNT"
+        if [ -n "$$(ls -A "$$MOUNT" 2>/dev/null)" ]; then
+          echo "  WARNING: $$MOUNT is not empty after unmount attempt — rclone may fail."
+          ls -la "$$MOUNT"
+          exit 1
+        fi
+        echo "  ✅ $$MOUNT is clean and ready for rclone."
+
   rclone:
     <<: *service-base
     container_name: rclone
@@ -227,6 +261,8 @@ services:
     cap_add: [SYS_ADMIN]
     devices: [/dev/fuse:/dev/fuse]
     security_opt: ["apparmor:unconfined"]
+    ports:
+      - "5572:5572"
     volumes:
       - /mnt/media/rclone/config:/config/rclone
       - /mnt:/mnt:rshared
@@ -234,6 +270,8 @@ services:
     depends_on:
       nzbdav:
         condition: service_healthy
+      rclone-init:
+        condition: service_completed_successfully
     # VFS cache on ssd-cache: 500GB max, 4h max age, 64MB chunk read-ahead.
     # --vfs-fast-fingerprint + --no-checksum reduce API calls significantly.
     # WARNING: avoid `find`/`du` on /mnt/nzbdav-data — thrashes VFS cache.
@@ -244,7 +282,7 @@ services:
       --links
       --use-cookies
       --rc
-      --rc-addr=localhost:5572
+      --rc-addr=0.0.0.0:5572
       --rc-no-auth
       --cache-dir=/cache
       --vfs-cache-mode full
@@ -341,76 +379,107 @@ services:
       <<: *health-default
       test: ["CMD-SHELL", "curl -fsS http://localhost:8989/ >/dev/null || exit 1"]
 
-  sonarr-anime:
-    <<: *service-base
-    container_name: sonarr-anime
-    image: lscr.io/linuxserver/sonarr:${SONARR_ANIME_TAG:-latest}
-    profiles: [media]
-    environment:
-      <<: *common-env
-      SONARR__POSTGRES__HOST: pgbouncer
-      SONARR__POSTGRES__PORT: 5432
-      SONARR__POSTGRES__USER: ${SONARR_ANIME_DB_USER:-${MASTER_USER}}
-      SONARR__POSTGRES__PASSWORD: ${SONARR_ANIME_DB_PASSWORD:-${MASTER_PASSWORD}}
-      SONARR__POSTGRES__MAINDB: ${SONARR_ANIME_DB:-sonarr-anime}
-      SONARR__POSTGRES__LOGDB: ${SONARR_ANIME_LOG_DB:-sonarr-anime-log}
-    ports:
-      - "8990:8989"
-    volumes:
-      - /mnt/media/sonarranime/data:/config
-      - /mnt/nzbdav-data/completed-symlinks/Anime:/downloads
-      - /mnt:/mnt:rslave
-    depends_on: *arr-dep
-    healthcheck:
-      <<: *health-default
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8989/ >/dev/null || exit 1"]
+#  sonarr-anime:
+#    <<: *service-base
+#    container_name: sonarr-anime
+#   image: lscr.io/linuxserver/sonarr:${SONARR_ANIME_TAG:-latest}
+#    profiles: [media]
+#    environment:
+#      <<: *common-env
+#      SONARR__POSTGRES__HOST: pgbouncer
+#      SONARR__POSTGRES__PORT: 5432
+#      SONARR__POSTGRES__USER: ${SONARR_ANIME_DB_USER:-${MASTER_USER}}
+#      SONARR__POSTGRES__PASSWORD: ${SONARR_ANIME_DB_PASSWORD:-${MASTER_PASSWORD}}
+#      SONARR__POSTGRES__MAINDB: ${SONARR_ANIME_DB:-sonarr-anime}
+#      SONARR__POSTGRES__LOGDB: ${SONARR_ANIME_LOG_DB:-sonarr-anime-log}
+#    ports:
+#      - "8990:8989"
+#    volumes:
+#      - /mnt/media/sonarranime/data:/config
+#      - /mnt/nzbdav-data/completed-symlinks/Anime:/downloads
+#      - /mnt:/mnt:rslave
+#    depends_on: *arr-dep
+#    healthcheck:
+#      <<: *health-default
+#      test: ["CMD-SHELL", "curl -fsS http://localhost:8989/ >/dev/null || exit 1"]
 
-  lidarr:
-    <<: *service-base
-    container_name: lidarr
-    image: lscr.io/linuxserver/lidarr:${LIDARR_TAG:-latest}
-    profiles: [media]
-    environment:
-      <<: *common-env
-      LIDARR_USE_POSTGRES: "true"
-      LIDARR__POSTGRES__HOST: pgbouncer
-      LIDARR__POSTGRES__PORT: 5432
-      LIDARR__POSTGRES__USER: ${LIDARR_DB_USER:-${MASTER_USER}}
-      LIDARR__POSTGRES__PASSWORD: ${LIDARR_DB_PASSWORD:-${MASTER_PASSWORD}}
-      LIDARR__POSTGRES__MAINDB: ${LIDARR_DB:-lidarr}
-    ports:
-      - "8686:8686"
-    volumes:
-      - /mnt/media/lidarr/config:/config
-      - /mnt/nzbdav-data/completed-symlinks/Music:/downloads
-      - /mnt:/mnt:rslave
-    depends_on: *arr-dep
-    healthcheck:
-      <<: *health-default
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8686/ >/dev/null || exit 1"]
+#  whisparr:
+#    <<: *service-base
+#    container_name: whisparr
+#    image: ghcr.io/hotio/whisparr:nightly
+#    profiles: [media]
+#    environment:
+#      <<: *common-env
+#      WHISPARR__POSTGRES__HOST: pgbouncer
+#      WHISPARR__POSTGRES__PORT: 5432
+#      WHISPARR__POSTGRES__MAINDB: ${WHISPARR_DB:-whisparr_db}
+#      WHISPARR__POSTGRES__USER: ${WHISPARR_DB_USER:-${MASTER_USER}}
+#      WHISPARR__POSTGRES__PASSWORD: ${WHISPARR_DB_PASSWORD:-${MASTER_PASSWORD}}
+#      WHISPARR__API_KEY: ${WHISPARR_API_KEY:-}
+#    ports:
+#      - "6969:6969"
+#    volumes:
+#      - /mnt/media/whisparr/data:/config
+#      - /mnt:/mnt:rslave
+#    depends_on: *arr-dep
+#    healthcheck:
+#      <<: *health-default
+#      test: ["CMD-SHELL", "curl -fsS http://localhost:6969/ >/dev/null || exit 1"]
 
-  whisparr:
+# ===========================================================================
+# 4b) MUSIC DISCOVERY (SoulSync + slskd)
+# ===========================================================================
+
+  slskd:
     <<: *service-base
-    container_name: whisparr
-    image: ghcr.io/hotio/whisparr:nightly
+    container_name: slskd
+    image: slskd/slskd:latest
     profiles: [media]
     environment:
       <<: *common-env
-      WHISPARR__POSTGRES__HOST: pgbouncer
-      WHISPARR__POSTGRES__PORT: 5432
-      WHISPARR__POSTGRES__MAINDB: ${WHISPARR_DB:-whisparr_db}
-      WHISPARR__POSTGRES__USER: ${WHISPARR_DB_USER:-${MASTER_USER}}
-      WHISPARR__POSTGRES__PASSWORD: ${WHISPARR_DB_PASSWORD:-${MASTER_PASSWORD}}
-      WHISPARR__API_KEY: ${WHISPARR_API_KEY:-}
+      SLSKD_REMOTE_CONFIGURATION: "true"
+      SLSKD_HTTP_LISTEN_PORT: 5030
+      SLSKD_SLSK_LISTEN_PORT: 50300
+      SLSKD_SHARED_DIR: /shares/music
+      SLSKD_SLSK_USERNAME: ${SLSK_USER}
+      SLSKD_SLSK_PASSWORD: ${SLSK_PASS}
+      SLSKD_API_KEY: ${SLSKD_API_KEY}
     ports:
-      - "6969:6969"
+      - "5030:5030"
+      - "50300:50300"
     volumes:
-      - /mnt/media/whisparr/data:/config
-      - /mnt:/mnt:rslave
-    depends_on: *arr-dep
+      - /mnt/media/slskd:/app                           # Config, DB, logs
+      - /mnt/media/slskd/downloads:/downloads           # Staging area for raw Soulseek downloads
+      - /mnt/media/emby-media/music:/shares/music:ro    # Share library back to Soulseek (avoids bans)
     healthcheck:
       <<: *health-default
-      test: ["CMD-SHELL", "curl -fsS http://localhost:6969/ >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:5030/ || exit 1"]
+
+#  soulsync:
+#    <<: *service-base
+#    container_name: soulsync
+#    image: boulderbadgedad/soulsync:latest
+#    profiles: [media]
+#    environment:
+#      <<: *common-env
+#    ports:
+#      - "8008:8008"   # WebUI
+#      - "8888:8888"   # Spotify OAuth callback
+#      - "8889:8889"   # Internal callback port
+#    volumes:
+#      - /mnt/media/soulsync/config:/app/config          # Config files
+#      - /mnt/media/soulsync/logs:/app/logs              # Logs
+#      - /mnt/media/soulsync/data:/app/data                     # ⚠️ Named volume — host path breaks Python modules
+#      - /mnt/media/slskd/downloads:/app/downloads       # Reads slskd completed downloads (same host path as slskd)
+#      - /mnt/media/emby-media/music:/app/Transfer:rw    # Organized files drop directly into Emby library
+#    extra_hosts:
+#      - "host.docker.internal:host-gateway"
+#    depends_on:
+#      slskd:
+#        condition: service_healthy
+#    healthcheck:
+#      <<: *health-default
+#      test: ["CMD-SHELL", "wget --spider -q http://localhost:8008/ || exit 1"]
 
   # ===========================================================================
   # 5) REQUESTS & STATS
@@ -440,27 +509,27 @@ services:
       <<: *health-default
       test: ["CMD-SHELL", "wget --spider -q http://localhost:5055/api/v1/status || exit 1"]
 
-  jellystat:
-    <<: *service-base
-    container_name: jellystat
-    image: cyfershepard/jellystat:${JELLYSTAT_TAG:-latest}
-    profiles: [media]
-    environment:
-      <<: *common-env
-      POSTGRES_IP: pgbouncer
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${JELLYSTAT_DB:-jfstat}
-      POSTGRES_USER: ${JELLYSTAT_DB_USER:-jellystat}
-      POSTGRES_PASSWORD: ${JELLYSTAT_DB_PASSWORD:?JELLYSTAT_DB_PASSWORD must be set in .env}
-      JWT_SECRET: ${JELLYSTAT_JWT_SECRET:?JELLYSTAT_JWT_SECRET must be set in .env}
-    volumes:
-      - /mnt/media/jellystat/backup-data:/app/backend/backup-data
-    ports:
-      - "3002:3000"
-    depends_on: *pgbouncer-dep
-    healthcheck:
-      <<: *health-default
-      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/ || exit 1"]
+#  jellystat:
+#    <<: *service-base
+#    container_name: jellystat
+#    image: cyfershepard/jellystat:${JELLYSTAT_TAG:-latest}
+#    profiles: [media]
+#    environment:
+#      <<: *common-env
+#      POSTGRES_IP: pgbouncer
+#      POSTGRES_PORT: 5432
+#      POSTGRES_DB: ${JELLYSTAT_DB:-jfstat}
+#      POSTGRES_USER: ${JELLYSTAT_DB_USER:-jellystat}
+#      POSTGRES_PASSWORD: ${JELLYSTAT_DB_PASSWORD:?JELLYSTAT_DB_PASSWORD must be set in .env}
+#      JWT_SECRET: ${JELLYSTAT_JWT_SECRET:?JELLYSTAT_JWT_SECRET must be set in .env}
+#    volumes:
+#      - /mnt/media/jellystat/backup-data:/app/backend/backup-data
+#    ports:
+#      - "3002:3000"
+#    depends_on: *pgbouncer-dep
+#    healthcheck:
+#      <<: *health-default
+#      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/ || exit 1"]
 
   # ===========================================================================
   # 6) MEDIA SERVERS / EDGE
@@ -537,7 +606,7 @@ services:
       - SYS_RAWIO
     # TODO: Enumerate all ZFS pool drives. Run: lsblk -d -o NAME,SIZE,TYPE | grep disk
     devices:
-      - /dev/sda:/dev/sda
+#      - /dev/sda:/dev/sda
       - /dev/sdb:/dev/sdb
       - /dev/sdc:/dev/sdc
     ports:

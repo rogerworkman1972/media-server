@@ -1,15 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# full-backup.sh — Pre-Syncoid DB Flush + Git Push
-# Purpose: Flush databases to disk before syncoid snapshots, then push
-#          the stack config to GitHub for offsite config backup.
-#
-# Syncoid handles all ZFS replication and snapshot retention automatically.
-# This script only does what syncoid cannot: DB consistency + config push.
-#
-# Systemd/Cron schedule: Run 15 minutes BEFORE syncoid (e.g. 03:15 UTC)
-#   Cron example:  15 3 * * * /opt/media-stack/full-backup.sh >> /var/log/media-backup/daily.log 2>&1
-#   Syncoid runs:  30 3 * * * (via syncoid.timer)
+# full-backup.sh — Pre-Snapshot DB Flush, Cache Sync & Git Push
+# Purpose: Flush databases and sync SSD cache to disk immediately before 
+#          snapshots, then push the stack config to GitHub.
 # ==============================================================================
 set -Eeuo pipefail
 
@@ -29,44 +22,54 @@ fi
 
 : "${MASTER_USER:?MASTER_USER not set in .env}"
 : "${NPM_MYSQL_ROOT_PASSWORD:?NPM_MYSQL_ROOT_PASSWORD not set in .env}"
-
 PROJECT_NAME="${PROJECT_NAME:-media-stack}"
 
+# --- EMBY CACHE PATHS ---
+# Corrected 'cashe' to 'cache' based on your system's mount points
+EMBY_CACHE_SRC="/mnt/ssd-cache/emby"
+EMBY_CACHE_DEST="/mnt/backup/ssd-cache-mirror/emby" 
+
 echo "============================================================"
-echo " Pre-Syncoid Flush — $DATE"
+echo " Pre-Snapshot Flush & Sync — $DATE"
 echo "============================================================"
 
 # ==============================================================================
 # 1. POSTGRES CHECKPOINT
-#    Flushes dirty WAL buffers to the ZFS dataset (/mnt/media/postgres)
-#    so syncoid's snapshot captures a clean, consistent state.
 # ==============================================================================
-echo "--- [1/3] Postgres CHECKPOINT ---"
-docker exec -t "${PROJECT_NAME}-postgres-1" \
+echo "--- [1/4] Postgres CHECKPOINT ---"
+docker exec "${PROJECT_NAME}-postgres-1" \
   psql -U "${MASTER_USER}" -d postgres -c "CHECKPOINT;" \
   && echo "  ✅ Postgres checkpoint complete." \
-  || echo "  ⚠️  Postgres checkpoint failed — syncoid will still snap, may catch dirty pages."
+  || echo "  ⚠️  Postgres checkpoint failed."
 
 # ==============================================================================
 # 2. MARIADB FLUSH
-#    No read lock needed — syncoid takes the ZFS snapshot, not us.
-#    FLUSH TABLES is enough to get clean table files on disk.
 # ==============================================================================
-echo "--- [2/3] MariaDB FLUSH TABLES ---"
-docker exec -t "${PROJECT_NAME}-nginx-db-1" \
-  mariadb -u root -p"${NPM_MYSQL_ROOT_PASSWORD}" \
-  -e "FLUSH TABLES;" \
+echo "--- [2/4] MariaDB FLUSH TABLES ---"
+docker exec "${PROJECT_NAME}-nginx-db-1" \
+  mariadb -u root -p"${NPM_MYSQL_ROOT_PASSWORD}" -e "FLUSH TABLES;" \
   && echo "  ✅ MariaDB flush complete." \
-  || echo "  ⚠️  MariaDB flush failed — check container health."
+  || echo "  ⚠️  MariaDB flush failed."
 
 # ==============================================================================
-# 3. GIT PUSH — Stack config offsite to GitHub
-#    Pushes /opt to rogerworkman1972/media-server (branch: main).
-#    Sensitive values stay in .env which should be in .gitignore.
+# 3. SYNC EMBY CACHE TO BACKUP POOL
 # ==============================================================================
-echo "--- [3/3] Git push /opt → GitHub ---"
+echo "--- [3/4] Rsync Emby Cache to Backup Tank ---"
+if [[ -d "$EMBY_CACHE_SRC" ]]; then
+  mkdir -p "$EMBY_CACHE_DEST"
+  # Using -a (archive) and --delete to keep an exact mirror
+  rsync -a --delete "$EMBY_CACHE_SRC/" "$EMBY_CACHE_DEST/"
+  echo "  ✅ Emby cache synced to $EMBY_CACHE_DEST."
+else
+  echo "  ⚠️  Emby cache source ($EMBY_CACHE_SRC) not found — skipping."
+fi
 
-REPO_URL="https://github.com/rogerworkman1972/media-server.git"
+# ==============================================================================
+# 4. GIT PUSH — Stack config offsite to GitHub
+# ==============================================================================
+echo "--- [4/4] Git push /opt → GitHub ---"
+
+REPO_URL="git@github.com:rogerworkman1972/media-server.git"
 BRANCH="main"
 SOURCE_DIR="/opt"
 WORK_DIR="/tmp/media_server_git_$$"
@@ -75,11 +78,12 @@ COMMIT_MSG="chore: daily sync — $(date '+%Y-%m-%d')"
 cleanup() { [[ -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
 
-if command -v git >/dev/null 2>&1 && [[ -d "$SOURCE_DIR" ]]; then
+if command -v git >/dev/null 2>&1 && command -v rsync >/dev/null 2>&1 && [[ -d "$SOURCE_DIR" ]]; then
   git clone --depth=1 --branch "$BRANCH" "$REPO_URL" "$WORK_DIR" 2>&1 | sed 's/^/  /'
 
   find "$WORK_DIR" -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
-  cp -a "$SOURCE_DIR"/. "$WORK_DIR/"
+  
+  rsync -a --exclude='.env' --exclude='.git' "$SOURCE_DIR/" "$WORK_DIR/"
 
   git -C "$WORK_DIR" add -A
 
@@ -92,16 +96,9 @@ if command -v git >/dev/null 2>&1 && [[ -d "$SOURCE_DIR" ]]; then
     echo "  ✅ Config pushed to GitHub."
   fi
 else
-  echo "  ⚠️  git not found or $SOURCE_DIR missing — skipping push."
+  echo "  ⚠️  git/rsync not found or $SOURCE_DIR missing — skipping push."
 fi
 
-# ==============================================================================
-# SUMMARY
-# ==============================================================================
-echo ""
 echo "============================================================"
-echo " ✅ DB flush complete — syncoid will snapshot at 03:30 UTC"
-echo " ✅ Config pushed to rogerworkman1972/media-server"
-echo " ℹ️  ZFS replication & retention managed by syncoid/sanoid"
 echo " Finished: $(date '+%Y-%m-%d %H:%M:%S UTC')"
 echo "============================================================"

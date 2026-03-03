@@ -72,9 +72,6 @@ CREATE DATABASE ${JELLYSEERR_DB:-jellyseerr} OWNER jellyseerr;
 
 CREATE USER jellystat WITH PASSWORD '${JELLYSTAT_DB_PASSWORD:?Error: JELLYSTAT_DB_PASSWORD not in .env}';
 CREATE DATABASE ${JELLYSTAT_DB:-jfstat} OWNER jellystat;
-
-CREATE USER ${LIDARR_DB_USER:-lidarr} WITH PASSWORD '${LIDARR_DB_PASSWORD:-lidarr_password}';
-CREATE DATABASE ${LIDARR_DB:-lidarr} OWNER ${LIDARR_DB_USER:-lidarr};
 EOF
   echo "✅ DB init complete. Restarting dependent services..."
   dc restart seerr jellystat lidarr
