@@ -1,74 +1,35 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# full-backup.sh — Pre-Snapshot DB Flush, Cache Sync & Git Push
-# Purpose: Flush databases and sync SSD cache to disk immediately before 
-#          snapshots, then push the stack config to GitHub.
+# full-backup.sh — Cache Sync & Git Push
+# Purpose: Sync SSD cache to the backup pool and push configs to GitHub.
+# Schedule: Run via Cron at 03:50 AM (10 mins before Sanoid snapshots).
 # ==============================================================================
 set -Eeuo pipefail
 
-STACK_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="/var/log/media-backup"
 DATE=$(date '+%Y-%m-%d %H:%M:%S UTC')
 
 mkdir -p "$LOG_DIR"
 
-# Load .env
-if [[ -f "$STACK_DIR/.env" ]]; then
-  set -a; source "$STACK_DIR/.env"; set +a
-else
-  echo "❌ ERROR: .env not found at $STACK_DIR/.env" >&2
-  exit 1
-fi
+echo "============================================================"
+echo " Cache Sync & Git Push — $DATE"
+echo "============================================================"
 
-: "${MASTER_USER:?MASTER_USER not set in .env}"
-: "${NPM_MYSQL_ROOT_PASSWORD:?NPM_MYSQL_ROOT_PASSWORD not set in .env}"
-PROJECT_NAME="${PROJECT_NAME:-media-stack}"
-
-# --- EMBY CACHE PATHS ---
-# Corrected 'cashe' to 'cache' based on your system's mount points
+# --- SYNC EMBY CACHE TO BACKUP POOL ---
 EMBY_CACHE_SRC="/mnt/ssd-cache/emby"
 EMBY_CACHE_DEST="/mnt/backup/ssd-cache-mirror/emby" 
 
-echo "============================================================"
-echo " Pre-Snapshot Flush & Sync — $DATE"
-echo "============================================================"
-
-# ==============================================================================
-# 1. POSTGRES CHECKPOINT
-# ==============================================================================
-echo "--- [1/4] Postgres CHECKPOINT ---"
-docker exec "${PROJECT_NAME}-postgres-1" \
-  psql -U "${MASTER_USER}" -d postgres -c "CHECKPOINT;" \
-  && echo "  ✅ Postgres checkpoint complete." \
-  || echo "  ⚠️  Postgres checkpoint failed."
-
-# ==============================================================================
-# 2. MARIADB FLUSH
-# ==============================================================================
-echo "--- [2/4] MariaDB FLUSH TABLES ---"
-docker exec "${PROJECT_NAME}-nginx-db-1" \
-  mariadb -u root -p"${NPM_MYSQL_ROOT_PASSWORD}" -e "FLUSH TABLES;" \
-  && echo "  ✅ MariaDB flush complete." \
-  || echo "  ⚠️  MariaDB flush failed."
-
-# ==============================================================================
-# 3. SYNC EMBY CACHE TO BACKUP POOL
-# ==============================================================================
-echo "--- [3/4] Rsync Emby Cache to Backup Tank ---"
+echo "--- [1/2] Rsync Emby Cache to Backup Tank ---"
 if [[ -d "$EMBY_CACHE_SRC" ]]; then
   mkdir -p "$EMBY_CACHE_DEST"
-  # Using -a (archive) and --delete to keep an exact mirror
   rsync -a --delete "$EMBY_CACHE_SRC/" "$EMBY_CACHE_DEST/"
   echo "  ✅ Emby cache synced to $EMBY_CACHE_DEST."
 else
   echo "  ⚠️  Emby cache source ($EMBY_CACHE_SRC) not found — skipping."
 fi
 
-# ==============================================================================
-# 4. GIT PUSH — Stack config offsite to GitHub
-# ==============================================================================
-echo "--- [4/4] Git push /opt → GitHub ---"
-
+# --- GIT PUSH CONFIGS TO GITHUB ---
+echo "--- [2/2] Git push /opt → GitHub ---"
 REPO_URL="git@github.com:rogerworkman1972/media-server.git"
 BRANCH="main"
 SOURCE_DIR="/opt"
@@ -83,6 +44,7 @@ if command -v git >/dev/null 2>&1 && command -v rsync >/dev/null 2>&1 && [[ -d "
 
   find "$WORK_DIR" -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
   
+  # Crucial: Excludes /opt/.env from being copied to the git repo
   rsync -a --exclude='.env' --exclude='.git' "$SOURCE_DIR/" "$WORK_DIR/"
 
   git -C "$WORK_DIR" add -A

@@ -5,22 +5,26 @@
 # ==============================================================================
 set -Eeuo pipefail
 
-# Load .env for credentials
-source "/opt/.env"
+# Load .env for credentials directly from /opt
+if [[ -f "/opt/.env" ]]; then
+  source "/opt/.env"
+else
+  echo "❌ ERROR: .env not found at /opt/.env" >&2
+  exit 1
+fi
 
-PROJECT_NAME="${PROJECT_NAME:-media-stack}"
 TARGET="${SANOID_TARGET:-unknown}"
 
 # 1. If Sanoid is snapping Postgres...
 if [[ "$TARGET" == *"postgres"* ]]; then
   echo "Sanoid target is $TARGET — Checkpointing Postgres..."
-  docker exec "${PROJECT_NAME}-postgres-1" \
+  docker exec postgres \
     psql -U "${MASTER_USER}" -d postgres -c "CHECKPOINT;" || true
 
 # 2. If Sanoid is snapping MySQL/MariaDB...
 elif [[ "$TARGET" == *"mysql"* ]]; then
   echo "Sanoid target is $TARGET — Flushing MariaDB..."
-  docker exec "${PROJECT_NAME}-nginx-db-1" \
+  docker exec nginx-db \
     mariadb -u root -p"${NPM_MYSQL_ROOT_PASSWORD}" -e "FLUSH TABLES;" || true
 
 else
