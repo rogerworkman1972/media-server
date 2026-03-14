@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # manage-stack.sh — Media Stack Manager
-# Instant hotkey TUI + DB init + ZFS snapshot helpers
+# Instant hotkey TUI + ZFS snapshot helpers
 # ==============================================================================
 
 # Docker socket check (fail fast before set -e kicks in)
@@ -64,19 +64,6 @@ pause() {
 # ==============================================================================
 # ACTIONS
 # ==============================================================================
-action_init_dbs() {
-  echo "Initializing Postgres databases (Jellystat, Seerr, Lidarr)..."
-  dc exec -T postgres psql -U "$PGUSER" -d "$PGDATABASE" <<EOF
-CREATE USER jellyseerr WITH PASSWORD '${JELLYSEERR_DB_PASSWORD:-jellyseerr}';
-CREATE DATABASE ${JELLYSEERR_DB:-jellyseerr} OWNER jellyseerr;
-
-CREATE USER jellystat WITH PASSWORD '${JELLYSTAT_DB_PASSWORD:?Error: JELLYSTAT_DB_PASSWORD not in .env}';
-CREATE DATABASE ${JELLYSTAT_DB:-jfstat} OWNER jellystat;
-EOF
-  echo "✅ DB init complete. Restarting dependent services..."
-  dc restart seerr jellystat lidarr
-}
-
 action_up_all() {
   ensure_network
   snapshot_zfs "pre-up"
@@ -104,6 +91,11 @@ action_checkpoint() {
   echo "✅ Checkpoint complete."
 }
 
+action_pg_shell() {
+  echo "🐘 Connecting to Postgres shell..."
+  docker exec -it postgres sh -lc "psql -U \"$PGUSER\" -d \"$PGDATABASE\""
+}
+
 action_prune() {
   echo "⚠️  This will remove all stopped containers, unused images, networks, and volumes."
   read -r -p "Confirm? [y/N]: " confirm
@@ -119,13 +111,14 @@ gui_menu() {
     echo "================================================================"
     echo " 🎬 Media Stack Manager: $PROJECT_NAME"
     echo "================================================================"
-    echo " [1] Up   — Start full stack        [6] Live stats (CPU/RAM)"
-    echo " [2] Down — Stop full stack         [7] Manage single service"
-    echo " [3] Restart full stack             [8] Prune system (cleanup)"
-    echo " [4] Update (pull + up)             [9] Validate config"
-    echo " [5] Status (show containers)       [i] Init Postgres DBs"
-    echo "                                    [c] Checkpoint Postgres"
-    echo "                                    [0] Exit"
+    echo " [1] Up   — Start full stack         [7] Manage single service"
+    echo " [2] Down — Stop full stack          [8] Prune system (cleanup)"
+    echo " [3] Restart full stack              [9] Validate config"
+    echo " [4] Update (pull + up)              [c] Checkpoint Postgres"
+    echo " [5] Status (show containers)        [p] Postgres Shell (psql)"
+    echo " [6] Live stats (CPU/RAM)"
+    echo " "
+    echo " [0] Exit"
     echo "================================================================"
     echo -n " Select: "
     read -r -n 1 CHOICE
@@ -137,18 +130,24 @@ gui_menu() {
       3) action_down_all && action_up_all ;;
       4) action_update ;;
       5) dc ps ;;
-      6) dc ps -q | xargs docker stats ;;
+      6) dc ps -q | xargs -r docker stats ;;
       7) gui_manage_single; continue ;;
       8) action_prune ;;
       9) dc config -q && echo "✅ Config valid." ;;
-      i) action_init_dbs ;;
       c) action_checkpoint ;;
-      0) exit 0 ;;
+      p) action_pg_shell ;;
+      0) 
+        echo "Exiting..."
+        break 
+        ;;
       *) echo "Invalid option." ;;
     esac
 
     pause
   done
+  
+  clear
+  return 0
 }
 
 gui_manage_single() {
@@ -165,6 +164,10 @@ gui_manage_single() {
   read -r svc_choice
 
   [[ "${svc_choice,,}" == "b" ]] && return
+
+  if ! [[ "$svc_choice" =~ ^[0-9]+$ ]]; then
+    echo "Invalid input. Please enter a number."; pause; return
+  fi
 
   local idx=$(( svc_choice - 1 ))
   local selected="${services[$idx]:-}"
@@ -194,13 +197,20 @@ gui_manage_single() {
 # ENTRYPOINT
 # ==============================================================================
 main() {
-  case "${1:-gui}" in
-    gui)  gui_menu ;;
-    up)   action_up_all ;;
-    down) action_down_all ;;
-    init) action_init_dbs ;;
-    *)    gui_menu ;;
+  # Handle unbound $1 safely with ${1:-}
+  local input_arg="${1:-gui}"
+  local cmd="${input_arg,,}"
+
+  case "$cmd" in
+    gui)   gui_menu ;;
+    up)    action_up_all ;;
+    down)  action_down_all ;;
+    *)     gui_menu ;;
   esac
 }
 
-main "$@"
+# Call main with all arguments safely
+main "${@:-}"
+
+# Ensure complete script termination
+exit 0

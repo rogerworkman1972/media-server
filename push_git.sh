@@ -11,7 +11,7 @@ set -euo pipefail
 # ------------------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------------------
-REPO_URL="https://github.com/rogerworkman1972/media-server.git"
+REPO_URL="git@github.com:rogerworkman1972/media-server.git"
 BRANCH="main"
 SOURCE_DIR="/opt"
 WORK_DIR="/tmp/media_server_sync_$$"
@@ -33,14 +33,12 @@ warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 # ------------------------------------------------------------------------------
-# Pre-flight checks
+# Pre-flight checks & Cleanup
 # ------------------------------------------------------------------------------
 command -v git >/dev/null 2>&1 || die "git is not installed."
+command -v rsync >/dev/null 2>&1 || die "rsync is not installed."
 [[ -d "$SOURCE_DIR" ]] || die "Source directory '$SOURCE_DIR' does not exist."
 
-# ------------------------------------------------------------------------------
-# Cleanup on exit
-# ------------------------------------------------------------------------------
 cleanup() { [[ -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
 
@@ -53,8 +51,9 @@ git clone --depth=1 --branch "$BRANCH" "$REPO_URL" "$WORK_DIR"
 info "Clearing existing tracked content…"
 find "$WORK_DIR" -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
 
-info "Copying $SOURCE_DIR → repo…"
-cp -a "$SOURCE_DIR"/. "$WORK_DIR/"
+info "Copying $SOURCE_DIR → repo (excluding .env)…"
+# CRITICAL: rsync is used instead of cp to safely exclude the .env file
+rsync -a --exclude='.env' --exclude='.git' "$SOURCE_DIR/" "$WORK_DIR/"
 
 git -C "$WORK_DIR" add -A
 

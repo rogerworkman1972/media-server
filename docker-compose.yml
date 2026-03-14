@@ -90,16 +90,16 @@ services:
       POSTGRES_DB: postgres
     volumes:
       - /mnt/media/postgres:/var/lib/postgresql/data
-    # Tuned for 48-core / 125GB host. shared_buffers=32GB, effective_cache=90GB.
-    # parallel workers max out all 48 cores; autovacuum uses 6 workers.
-    # Data lives on /mnt/media/postgres (ZFS dataset) — snapshot-friendly.
+    # Tuned for 48-core / 125GB host running ZFS.
+    # ZFS ARC handles caching, so shared_buffers is reduced to prevent double-caching.
+    # ZFS Copy-on-Write prevents torn pages, allowing us to disable full_page_writes.
     command: >
       postgres
-      -c max_connections=100
-      -c shared_buffers=32GB
-      -c effective_cache_size=90GB
+      -c max_connections=64
+      -c shared_buffers=8GB
+      -c effective_cache_size=38GB
       -c maintenance_work_mem=2GB
-      -c work_mem=32MB
+      -c work_mem=128MB
       -c checkpoint_completion_target=0.9
       -c wal_buffers=16MB
       -c min_wal_size=2GB
@@ -115,9 +115,12 @@ services:
       -c pg_stat_statements.max=10000
       -c pg_stat_statements.track=all
       -c autovacuum_max_workers=6
-      -c autovacuum_work_mem=-1
+      -c autovacuum_work_mem=256MB
       -c autovacuum_vacuum_scale_factor=0.05
       -c autovacuum_analyze_scale_factor=0.02
+      -c full_page_writes=off
+      -c wal_init_zero=off
+      -c wal_recycle=off
     deploy:
       resources:
         limits:
@@ -146,6 +149,9 @@ services:
       # Sonarr/Radarr send extra_float_digits AND application_name on connect.
       # Both must be ignored in transaction mode or PgBouncer rejects the packet.
       IGNORE_STARTUP_PARAMETERS: extra_float_digits,application_name
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     ports:
       - "127.0.0.1:6432:5432"
     depends_on:
@@ -203,7 +209,7 @@ services:
   nzbdav:
     <<: *service-base
     container_name: nzbdav
-    image: nzbdav/nzbdav:${NZBDAV_TAG:-2026-02-19.dev}
+    image: nzbdav/nzbdav:${NZBDAV_TAG:-latest}
     profiles: [media]
     environment:
       <<: *common-env
@@ -213,6 +219,8 @@ services:
     volumes:
       - /mnt/media/nzbdav/config:/config
       - /mnt:/mnt
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     depends_on:
       db-ready:
         condition: service_completed_successfully
@@ -256,7 +264,7 @@ services:
   rclone:
     <<: *service-base
     container_name: rclone
-    image: rclone/rclone:latest
+    image: rclone/rclone:1.73.1
     profiles: [media]
     cap_add: [SYS_ADMIN]
     devices: [/dev/fuse:/dev/fuse]
@@ -267,6 +275,8 @@ services:
       - /mnt/media/rclone/config:/config/rclone
       - /mnt:/mnt:rshared
       - /mnt/ssd-cache/rclone/cache-nzbdav:/cache
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     depends_on:
       nzbdav:
         condition: service_healthy
@@ -288,10 +298,10 @@ services:
       --vfs-cache-mode full
       --vfs-cache-max-size ${RCLONE_VFS_CACHE_MAX_SIZE:-500G}
       --vfs-cache-max-age ${RCLONE_VFS_CACHE_MAX_AGE:-4h}
-      --vfs-read-chunk-size 64M
-      --vfs-read-ahead 512M
-      --buffer-size 256M
-      --dir-cache-time 1h
+      --buffer-size 32M
+      --vfs-read-chunk-size 32M
+      --vfs-read-chunk-size-limit 2G
+      --dir-cache-time 24h
       --attr-timeout 1h
       --no-modtime
       --no-checksum
@@ -348,7 +358,6 @@ services:
       - "7878:7878"
     volumes:
       - /mnt/media/radarr/data:/config
-      - /mnt/nzbdav-data/completed-symlinks/Movies:/downloads
       - /mnt:/mnt:rslave
     depends_on: *arr-dep
     healthcheck:
@@ -372,59 +381,84 @@ services:
       - "8989:8989"
     volumes:
       - /mnt/media/sonarr/data:/config
-      - /mnt/nzbdav-data/completed-symlinks/Series:/downloads
       - /mnt:/mnt:rslave
     depends_on: *arr-dep
     healthcheck:
       <<: *health-default
       test: ["CMD-SHELL", "curl -fsS http://localhost:8989/ >/dev/null || exit 1"]
 
-#  sonarr-anime:
-#    <<: *service-base
-#    container_name: sonarr-anime
-#   image: lscr.io/linuxserver/sonarr:${SONARR_ANIME_TAG:-latest}
-#    profiles: [media]
-#    environment:
-#      <<: *common-env
-#      SONARR__POSTGRES__HOST: pgbouncer
-#      SONARR__POSTGRES__PORT: 5432
-#      SONARR__POSTGRES__USER: ${SONARR_ANIME_DB_USER:-${MASTER_USER}}
-#      SONARR__POSTGRES__PASSWORD: ${SONARR_ANIME_DB_PASSWORD:-${MASTER_PASSWORD}}
-#      SONARR__POSTGRES__MAINDB: ${SONARR_ANIME_DB:-sonarr-anime}
-#      SONARR__POSTGRES__LOGDB: ${SONARR_ANIME_LOG_DB:-sonarr-anime-log}
-#    ports:
-#      - "8990:8989"
-#    volumes:
-#      - /mnt/media/sonarranime/data:/config
-#      - /mnt/nzbdav-data/completed-symlinks/Anime:/downloads
-#      - /mnt:/mnt:rslave
-#    depends_on: *arr-dep
-#    healthcheck:
-#      <<: *health-default
-#      test: ["CMD-SHELL", "curl -fsS http://localhost:8989/ >/dev/null || exit 1"]
+  sonarr-anime:
+    <<: *service-base
+    container_name: sonarr-anime
+    image: lscr.io/linuxserver/sonarr:${SONARR_ANIME_TAG:-latest}
+    profiles: [media]
+    environment:
+      <<: *common-env
+      SONARR__POSTGRES__HOST: pgbouncer
+      SONARR__POSTGRES__PORT: 5432
+      SONARR__POSTGRES__USER: ${SONARR_ANIME_DB_USER:-${MASTER_USER}}
+      SONARR__POSTGRES__PASSWORD: ${SONARR_ANIME_DB_PASSWORD:-${MASTER_PASSWORD}}
+      SONARR__POSTGRES__MAINDB: ${SONARR_ANIME_DB:-sonarr-anime}
+      SONARR__POSTGRES__LOGDB: ${SONARR_ANIME_LOG_DB:-sonarr-anime-log}
+    ports:
+      - "8990:8989"
+    volumes:
+      - /mnt/media/sonarranime/data:/config
+      - /mnt:/mnt:rslave
+    depends_on: *arr-dep
+    healthcheck:
+      <<: *health-default
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8989/ >/dev/null || exit 1"]
 
-#  whisparr:
-#    <<: *service-base
-#    container_name: whisparr
-#    image: ghcr.io/hotio/whisparr:nightly
-#    profiles: [media]
-#    environment:
-#      <<: *common-env
-#      WHISPARR__POSTGRES__HOST: pgbouncer
-#      WHISPARR__POSTGRES__PORT: 5432
-#      WHISPARR__POSTGRES__MAINDB: ${WHISPARR_DB:-whisparr_db}
-#      WHISPARR__POSTGRES__USER: ${WHISPARR_DB_USER:-${MASTER_USER}}
-#      WHISPARR__POSTGRES__PASSWORD: ${WHISPARR_DB_PASSWORD:-${MASTER_PASSWORD}}
-#      WHISPARR__API_KEY: ${WHISPARR_API_KEY:-}
-#    ports:
-#      - "6969:6969"
-#    volumes:
-#      - /mnt/media/whisparr/data:/config
-#      - /mnt:/mnt:rslave
-#    depends_on: *arr-dep
-#    healthcheck:
-#      <<: *health-default
-#      test: ["CMD-SHELL", "curl -fsS http://localhost:6969/ >/dev/null || exit 1"]
+  whisparr:
+    <<: *service-base
+    container_name: whisparr
+    image: ghcr.io/hotio/whisparr:nightly
+    profiles: [media]
+    environment:
+      <<: *common-env
+      WHISPARR__POSTGRES__HOST: pgbouncer
+      WHISPARR__POSTGRES__PORT: 5432
+      WHISPARR__POSTGRES__MAINDB: ${WHISPARR_DB:-whisparr_db}
+      WHISPARR__POSTGRES__USER: ${WHISPARR_DB_USER:-${MASTER_USER}}
+      WHISPARR__POSTGRES__PASSWORD: ${WHISPARR_DB_PASSWORD:-${MASTER_PASSWORD}}
+      WHISPARR__API_KEY: ${WHISPARR_API_KEY:-}
+    ports:
+      - "6969:6969"
+    volumes:
+      - /mnt/media/whisparr/data:/config
+      - /mnt:/mnt:rslave
+    depends_on: *arr-dep
+    healthcheck:
+      <<: *health-default
+      test: ["CMD-SHELL", "curl -fsS http://localhost:6969/ >/dev/null || exit 1"]
+
+  bookshelf:
+    <<: *service-base
+    container_name: bookshelf
+    # The :hardcover tag forces it to use the working Hardcover.app API
+    image: ghcr.io/pennydreadful/bookshelf:hardcover
+    profiles: [media]
+    environment:
+      <<: *common-env
+      # Bookshelf uses the exact same DB variables as Readarr!
+      READARR__POSTGRES__HOST: pgbouncer
+      READARR__POSTGRES__PORT: 5432
+      READARR__POSTGRES__USER: ${READARR_DB_USER:-${MASTER_USER}}
+      READARR__POSTGRES__PASSWORD: ${READARR_DB_PASSWORD:-${MASTER_PASSWORD}}
+      READARR__POSTGRES__MAINDB: ${READARR_DB:-readarr_main}
+      READARR__POSTGRES__LOGDB: ${READARR_LOG_DB:-readarr_log}
+      READARR__POSTGRES__CACHEDB: ${READARR_CACHE_DB:-readarr_cache}
+      READARR_API_KEY: ${READARR_API_KEY:-}
+    ports:
+      - "8787:8787"
+    volumes:
+      - /mnt/media/bookshelf/data:/config
+      - /mnt:/mnt:rslave
+    depends_on: *arr-dep
+    healthcheck:
+      <<: *health-default
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8787/ >/dev/null || exit 1"]
 
 # ===========================================================================
 # 4b) MUSIC DISCOVERY (SoulSync + slskd)
@@ -450,36 +484,34 @@ services:
     volumes:
       - /mnt/media/slskd:/app                           # Config, DB, logs
       - /mnt/media/slskd/downloads:/downloads           # Staging area for raw Soulseek downloads
-      - /mnt/media/emby-media/music:/shares/music:ro    # Share library back to Soulseek (avoids bans)
+      - /mnt/music-tank:/shares/music:ro    # Share library back to Soulseek (avoids bans)
     healthcheck:
       <<: *health-default
       test: ["CMD-SHELL", "wget --spider -q http://localhost:5030/ || exit 1"]
 
-#  soulsync:
-#    <<: *service-base
-#    container_name: soulsync
-#    image: boulderbadgedad/soulsync:latest
-#    profiles: [media]
-#    environment:
-#      <<: *common-env
-#    ports:
-#      - "8008:8008"   # WebUI
-#      - "8888:8888"   # Spotify OAuth callback
-#      - "8889:8889"   # Internal callback port
-#    volumes:
-#      - /mnt/media/soulsync/config:/app/config          # Config files
-#      - /mnt/media/soulsync/logs:/app/logs              # Logs
-#      - /mnt/media/soulsync/data:/app/data                     # ⚠️ Named volume — host path breaks Python modules
-#      - /mnt/media/slskd/downloads:/app/downloads       # Reads slskd completed downloads (same host path as slskd)
-#      - /mnt/media/emby-media/music:/app/Transfer:rw    # Organized files drop directly into Emby library
-#    extra_hosts:
-#      - "host.docker.internal:host-gateway"
-#    depends_on:
-#      slskd:
-#        condition: service_healthy
-#    healthcheck:
-#      <<: *health-default
-#      test: ["CMD-SHELL", "wget --spider -q http://localhost:8008/ || exit 1"]
+  soulsync:
+    <<: *service-base
+    container_name: soulsync
+    image: boulderbadgedad/soulsync:latest
+    profiles: [media]
+    environment:
+      <<: *common-env
+    ports:
+      - "8008:8008"   # WebUI
+      - "8888:8888"   # Spotify OAuth callback
+      - "8889:8889"   # Internal callback port
+    volumes:
+      - /mnt/media/soulsync/config:/app/config          # Config files
+      - /mnt/media/soulsync/logs:/app/logs              # Logs
+      - /mnt/media/soulsync/data:/app/data                     # ⚠️ Named volume — host path breaks Python modules
+      - /mnt/media/slskd/downloads:/app/downloads       # Reads slskd completed downloads (same host path as slskd)
+      - /mnt/music-tank:/shares/music:ro    # Organized files drop directly into Emby library
+    depends_on:
+      slskd:
+        condition: service_healthy
+    healthcheck:
+      <<: *health-default
+      test: ["CMD-SHELL", "curl -f -s -m 5 http://localhost:8008/ || wget -q -O /dev/null -T 5 http://localhost:8008/ || exit 1"]
 
   # ===========================================================================
   # 5) REQUESTS & STATS
@@ -580,10 +612,12 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      - "127.0.0.1:81:81"
+      - "81:81"
     volumes:
       - /mnt/media/nginx/data:/data
       - /mnt/media/nginx/letsencrypt:/etc/letsencrypt
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     depends_on:
       db-ready:
         condition: service_completed_successfully
@@ -606,7 +640,6 @@ services:
       - SYS_RAWIO
     # TODO: Enumerate all ZFS pool drives. Run: lsblk -d -o NAME,SIZE,TYPE | grep disk
     devices:
-#      - /dev/sda:/dev/sda
       - /dev/sdb:/dev/sdb
       - /dev/sdc:/dev/sdc
     ports:
@@ -621,18 +654,18 @@ services:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8080/api/health >/dev/null || exit 1"]
 
   netdata:
-    <<: *service-base
+    restart: unless-stopped
     container_name: netdata
     image: netdata/netdata:${NETDATA_TAG:-stable}
     profiles: [ops]
     hostname: ${NETDATA_HOSTNAME:-media-server}
+    network_mode: host
+    pid: host
     cap_add:
       - SYS_PTRACE
       - SYS_ADMIN
     security_opt:
       - apparmor:unconfined
-    ports:
-      - "127.0.0.1:19999:19999"
     environment:
       <<: *common-env
       NETDATA_CLAIM_TOKEN: ${NETDATA_CLAIM_TOKEN:-}
