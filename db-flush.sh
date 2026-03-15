@@ -34,9 +34,9 @@ if [[ "$TARGET" == *"postgres"* ]]; then
 elif [[ "$TARGET" == *"mysql"* ]]; then
   echo "Sanoid target is $TARGET — Flushing MariaDB..."
   if is_running "nginx-db"; then
-    # Added 5s timeout to prevent Sanoid from hanging/crashing
-    if timeout 5s docker exec nginx-db \
-      mariadb -u root -p"${NPM_MYSQL_ROOT_PASSWORD}" -e "FLUSH TABLES WITH READ LOCK; UNLOCK TABLES;"; then
+    # Added 30s timeout to prevent Sanoid from hanging/crashing
+    if timeout 30s docker exec nginx-db \
+      mariadb -u root -p"${NPM_MYSQL_ROOT_PASSWORD}" -e "FLUSH TABLES;"; then
       echo "✅ MariaDB flush successful."
     else
       echo "⚠️ MariaDB flush timed out or failed."

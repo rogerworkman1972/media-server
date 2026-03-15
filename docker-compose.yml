@@ -106,7 +106,7 @@ services:
       -c max_wal_size=16GB
       -c default_statistics_target=100
       -c random_page_cost=1.1
-      -c effective_io_concurrency=300
+      -c effective_io_concurrency=100
       -c max_worker_processes=48
       -c max_parallel_workers_per_gather=4
       -c max_parallel_workers=48
@@ -410,28 +410,28 @@ services:
       <<: *health-default
       test: ["CMD-SHELL", "curl -fsS http://localhost:8989/ >/dev/null || exit 1"]
 
-  whisparr:
+  stash:
     <<: *service-base
-    container_name: whisparr
-    image: ghcr.io/hotio/whisparr:nightly
+    container_name: stash
+    image: stashapp/stash:latest
     profiles: [media]
     environment:
       <<: *common-env
-      WHISPARR__POSTGRES__HOST: pgbouncer
-      WHISPARR__POSTGRES__PORT: 5432
-      WHISPARR__POSTGRES__MAINDB: ${WHISPARR_DB:-whisparr_db}
-      WHISPARR__POSTGRES__USER: ${WHISPARR_DB_USER:-${MASTER_USER}}
-      WHISPARR__POSTGRES__PASSWORD: ${WHISPARR_DB_PASSWORD:-${MASTER_PASSWORD}}
-      WHISPARR__API_KEY: ${WHISPARR_API_KEY:-}
+      # Note: Postgres/API variables have been removed. 
+      # Stash uses SQLite by default, which is highly recommended.
     ports:
-      - "6969:6969"
+      # Stash defaults to 9999 instead of 6969
+      - "9999:9999"
     volumes:
-      - /mnt/media/whisparr/data:/config
-      - /mnt:/mnt:rslave
-    depends_on: *arr-dep
+      # The config folder MUST map to /root/.stash in the container
+      - /mnt/media/stash/data:/root/.stash
+      # Specific mount for your media directory
+      - /mnt:/mnt:rslave 
+    # depends_on: *arr-dep # (See note below about removing this)
     healthcheck:
       <<: *health-default
-      test: ["CMD-SHELL", "curl -fsS http://localhost:6969/ >/dev/null || exit 1"]
+      # Updated the port for the curl check
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9999/ >/dev/null || exit 1"]
 
   bookshelf:
     <<: *service-base
@@ -685,6 +685,66 @@ services:
       - /var/log:/host/var/log:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /run/dbus:/run/dbus:ro
+
+# ===========================================================================
+# 8) LOCAL AI (Ollama & Open WebUI)
+# ===========================================================================
+
+  ollama:
+    <<: *service-base
+    container_name: ollama
+    image: ollama/ollama:latest
+    profiles: [media]
+    runtime: nvidia   # Shares the GPU with Emby for fast AI inference
+    environment:
+      <<: *common-env
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      OLLAMA_KEEP_ALIVE: "5m" # Unloads models from VRAM after 5 mins of inactivity to free it up for Emby
+    volumes:
+      - /mnt/media/ollama/data:/root/.ollama
+    ports:
+      - "11434:11434"
+    healthcheck:
+      <<: *health-default
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+
+  open-webui:
+    <<: *service-base
+    container_name: open-webui
+    image: ghcr.io/open-webui/open-webui:main
+    profiles: [media]
+    environment:
+      <<: *common-env
+      OLLAMA_BASE_URL: http://ollama:11434
+      WEBUI_AUTH: "true" # Highly recommended to keep this true if exposed via Nginx
+    volumes:
+      - /mnt/media/openwebui/data:/app/backend/data
+    ports:
+      - "3004:8080" # Maps Open WebUI to port 3004 on your host
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+# ===========================================================================
+# 9) STATIC WEBSERVER
+# ===========================================================================
+
+  webserver:
+    <<: *service-base
+    container_name: webserver
+    image: nginx:alpine
+    profiles: [media]
+    environment:
+      <<: *common-env
+    volumes:
+      # Maps a local folder to the Nginx default HTML directory
+      - /mnt/media/webserver/html:/usr/share/nginx/html:ro
+    ports:
+      - "7050:80"
+    healthcheck:
+      <<: *health-default
+      test: ["CMD-SHELL", "wget --spider -q http://localhost/ || exit 1"]
 
 # ===========================================================================
 # NETWORKS & VOLUMES
