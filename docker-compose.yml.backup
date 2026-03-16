@@ -124,7 +124,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 48G
+          memory: 64G
     healthcheck:
       <<: *health-default
       test: ["CMD-SHELL", "pg_isready -U ${MASTER_USER} -d postgres"]
@@ -242,7 +242,6 @@ services:
       nzbdav:
         condition: service_healthy
     # Ensures /mnt/nzbdav-data is a clean, empty directory before rclone mounts.
-    # If rclone is already running with an active FUSE mount, skip cleanup.
     # If a stale FUSE mount exists, rclone will fail with "mountpoint not empty".
     # This init container forcefully clears any leftover state on every stack start.
     command:
@@ -251,11 +250,6 @@ services:
       - |
         MOUNT=/mnt/nzbdav-data
         echo "Checking $$MOUNT before rclone mount..."
-        # If rclone already has an active, healthy mount, nothing to do
-        if mountpoint -q "$$MOUNT" 2>/dev/null; then
-          echo "  $$MOUNT is already an active mount — skipping cleanup."
-          exit 0
-        fi
         # Attempt lazy unmount in case a stale FUSE mount is still registered
         umount -l "$$MOUNT" 2>/dev/null && echo "  Stale mount removed." || true
         # Ensure the directory exists and is empty
@@ -265,7 +259,7 @@ services:
           ls -la "$$MOUNT"
           exit 1
         fi
-        echo "  $$MOUNT is clean and ready for rclone.
+        echo "  ✅ $$MOUNT is clean and ready for rclone."
 
   rclone:
     <<: *service-base
@@ -618,7 +612,7 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      - "127.0.0.1:81:81"   # Admin panel: localhost only — use SSH tunnel to access
+      - "81:81"
     volumes:
       - /mnt/media/nginx/data:/data
       - /mnt/media/nginx/letsencrypt:/etc/letsencrypt
@@ -644,18 +638,10 @@ services:
     profiles: [ops]
     cap_add:
       - SYS_RAWIO
-    # All ZFS pool drives + boot SSD + SSD cache (post-reboot layout as of 2026-03-16)
+    # TODO: Enumerate all ZFS pool drives. Run: lsblk -d -o NAME,SIZE,TYPE | grep disk
     devices:
-      - /dev/sda:/dev/sda     # music-tank (HGST 10TB)
-      - /dev/sdb:/dev/sdb     # ssd-cache (XFS 954GB)
-      - /dev/sdc:/dev/sdc     # media-tank (Samsung SSD 1.8TB)
-      - /dev/sdd:/dev/sdd     # music-tank (HGST 10TB)
-      - /dev/sde:/dev/sde     # media-tank (Samsung SSD 1.9TB)
-      - /dev/sdf:/dev/sdf     # music-tank (HGST 10TB)
-      - /dev/sdg:/dev/sdg     # media-tank (Samsung SSD 1.8TB)
-      - /dev/sdh:/dev/sdh     # backup-tank (HGST 10TB)
-      - /dev/sdi:/dev/sdi     # media-tank (Samsung SSD 1.8TB)
-      - /dev/sdj:/dev/sdj     # Boot SSD (1.9TB ext4)
+      - /dev/sdb:/dev/sdb
+      - /dev/sdc:/dev/sdc
     ports:
       - "8081:8080"
     volumes:
@@ -672,7 +658,6 @@ services:
     container_name: netdata
     image: netdata/netdata:${NETDATA_TAG:-stable}
     profiles: [ops]
-    logging: *logging-default
     hostname: ${NETDATA_HOSTNAME:-media-server}
     network_mode: host
     pid: host

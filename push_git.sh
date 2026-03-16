@@ -51,9 +51,17 @@ git clone --depth=1 --branch "$BRANCH" "$REPO_URL" "$WORK_DIR"
 info "Clearing existing tracked content…"
 find "$WORK_DIR" -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
 
-info "Copying $SOURCE_DIR → repo (excluding .env)…"
-# CRITICAL: rsync is used instead of cp to safely exclude the .env file
-rsync -a --exclude='.env' --exclude='.git' "$SOURCE_DIR/" "$WORK_DIR/"
+info "Copying $SOURCE_DIR → repo (excluding secrets and one-off scripts)…"
+# CRITICAL: Exclude .env, any Python scripts (may contain API keys),
+# and any files that should not be in version control.
+rsync -a \
+  --exclude='.env' \
+  --exclude='.git' \
+  --exclude='*.pyc' \
+  --exclude='__pycache__' \
+  --exclude='radarr.py' \
+  --exclude='sonarr.py' \
+  "$SOURCE_DIR/" "$WORK_DIR/"
 
 git -C "$WORK_DIR" add -A
 

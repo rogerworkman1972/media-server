@@ -24,8 +24,12 @@ is_running() {
 if [[ "$TARGET" == *"postgres"* ]]; then
   echo "Sanoid target is $TARGET — Checkpointing Postgres..."
   if is_running "postgres"; then
-    docker exec postgres \
-      psql -U "${MASTER_USER:-admin}" -d postgres -c "CHECKPOINT;" || echo "⚠️ Postgres checkpoint failed."
+    if timeout 120s docker exec postgres \
+      psql -U "${MASTER_USER:-admin}" -d postgres -c "CHECKPOINT;"; then
+      echo "✅ Postgres checkpoint successful."
+    else
+      echo "⚠️ Postgres checkpoint timed out or failed."
+    fi
   else
     echo "⚠️ Postgres container is not running. Skipping."
   fi

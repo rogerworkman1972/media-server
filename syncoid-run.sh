@@ -1,15 +1,34 @@
 #!/usr/bin/env bash
+# ==============================================================================
+# syncoid-run.sh — ZFS Replication to backup-tank
+# Schedule: Cron at 04:15 AM (after Sanoid snapshots at 04:00 AM)
+# ==============================================================================
+set -euo pipefail
 
-# Your Discord Webhook URL
-WEBHOOK_URL="https://discordapp.com/api/webhooks/1480604457762029638/5GO_G0Idm0WGpAmL35cvYjMEDEfDAI-Dx0AFxQM20oJVya9PLDjEDsl1WQPWwhD1ij8T"
+# Load .env for DISCORD_WEBHOOK_URL
+ENV_FILE="/opt/.env"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a; source "$ENV_FILE"; set +a
+fi
 
-# Run Syncoid and log the output
-/usr/sbin/syncoid -r --no-sync-snap media-tank backup-tank/media-mirror >> /var/log/media-backup/syncoid.log 2>&1
+WEBHOOK_URL="${DISCORD_WEBHOOK_URL:?DISCORD_WEBHOOK_URL must be set in .env}"
+LOG="/var/log/media-backup/syncoid.log"
+FAILED=0
 
-# Check the exit status of the Syncoid command
-if [ $? -ne 0 ]; then
-  # If the exit status is NOT 0 (meaning it failed), send a Discord alert
+# --- 1. Replicate media-tank (Excluding Docker System Files) ---
+echo "$(date '+%Y-%m-%d %H:%M:%S') — Starting media-tank replication" >> "$LOG"
+if ! /usr/sbin/syncoid -r --exclude=media-tank/docker --no-sync-snap media-tank backup-tank/media-mirror >> "$LOG" 2>&1; then
+  FAILED=1
+fi
+
+# --- 2. Replicate music-tank ---
+echo "$(date '+%Y-%m-%d %H:%M:%S') — Starting music-tank replication" >> "$LOG"
+if ! /usr/sbin/syncoid -r --no-sync-snap music-tank backup-tank/music-mirror >> "$LOG" 2>&1; then
+  FAILED=1
+fi
+
+# --- Alert on failure ---
+if [[ "$FAILED" -ne 0 ]]; then
   JSON_PAYLOAD='{"content": "🚨 **URGENT:** Syncoid replication to `backup-tank` FAILED! Please check `/var/log/media-backup/syncoid.log` for details."}'
-  
-  curl -H "Content-Type: application/json" -d "$JSON_PAYLOAD" $WEBHOOK_URL
+  curl -s -H "Content-Type: application/json" -d "$JSON_PAYLOAD" "$WEBHOOK_URL"
 fi

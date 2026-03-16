@@ -120,6 +120,9 @@ fi
         echo "--- Docker Storage Usage ---"
         docker system df || echo "Requires root or Docker daemon is not running."
         echo ""
+        echo "--- Docker Engine Config (Verifying ZFS integration) ---"
+        docker info | grep -Ei 'Storage Driver|Backing Filesystem|Docker Root Dir' || echo "Requires root."
+        echo ""
         echo "--- Running & Stopped Containers ---"
         docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" || echo "Requires root or Docker daemon is not running."
     else
@@ -128,7 +131,44 @@ fi
     echo '```'
     echo ""
 
-    echo "## 10. Recent Kernel Warnings/Errors"
+    echo "## 10. Automated Backups & ZFS Snapshots"
+    echo "### Sanoid Configuration (/etc/sanoid/sanoid.conf)"
+    echo '```ini'
+    cat /etc/sanoid/sanoid.conf 2>/dev/null || echo "Sanoid config not found or requires root."
+    echo '```'
+    echo ""
+    echo "### Syncoid Replication Script (/opt/syncoid-run.sh)"
+    echo '```bash'
+    cat /opt/syncoid-run.sh 2>/dev/null || echo "Syncoid script not found."
+    echo '```'
+    echo ""
+    echo "### Sanoid Timer Status"
+    echo '```text'
+    systemctl status sanoid.timer 2>/dev/null | head -n 10 || echo "Sanoid timer not found."
+    echo '```'
+    echo ""
+
+    echo "## 11. Database Pre-Snapshot Hooks"
+    echo "### Database Flush Script (/opt/db-flush.sh)"
+    echo '```bash'
+    cat /opt/db-flush.sh 2>/dev/null || echo "DB flush script not found."
+    echo '```'
+    echo ""
+
+    echo "## 12. Scheduled Tasks"
+    echo "### Root Crontab"
+    echo '```bash'
+    crontab -l 2>/dev/null || echo "No crontab found or requires root."
+    echo '```'
+    echo ""
+
+    echo "## 13. Server Configuration Directory (/opt)"
+    echo '```text'
+    ls -la /opt/ 2>/dev/null || echo "Directory not found."
+    echo '```'
+    echo ""
+
+    echo "## 14. Recent Kernel Warnings/Errors"
     echo '```text'
     dmesg -T --level=err,warn | tail -n 20 || echo "No recent errors, or requires root/sudo to view dmesg."
     echo '```'
