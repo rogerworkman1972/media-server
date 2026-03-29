@@ -8,10 +8,10 @@
 # ---------------------------------------------------------------------------
 # NUMA TOPOLOGY (Dual Xeon E5-2697 v2):
 #   Node 0 CPUs: 0-11, 24-35  — all PCIe devices: LSI SAS2308, I350 NICs,
-#                               Intel C600/C602 SATA, ZFS ARC
+#                                Intel C600/C602 SATA, ZFS ARC
 #   Node 1 CPUs: 12-23, 36-47 — NVIDIA RTX 3060 (83:00.0, NUMA node 1)
 #
-# cpuset    → which CPU cores the container may use
+# cpuset      → which CPU cores the container may use
 # ---------------------------------------------------------------------------
 
 # ===========================================================================
@@ -21,7 +21,7 @@
 x-common-env: &common-env
   PUID: ${PUID:-1000}
   PGID: ${PGID:-1000}
-  UMASK: ${UMASK:-000}
+  UMASK: ${UMASK:-002}
   TZ: ${TZ:-America/New_York}
 
 x-health-default: &health-default
@@ -87,13 +87,11 @@ services:
 
   # ===========================================================================
   # 1) CORE DATABASE
-  # Provides the foundation for all application data storage.
   # ===========================================================================
 
   postgres:
     <<: *pg-common
     container_name: postgres
-    user: "${PUID:-1000}:${PGID:-1000}"
     environment:
       <<: *common-env
       POSTGRES_USER: ${MASTER_USER}
@@ -216,8 +214,7 @@ services:
     command: ["sh", "-c", "echo 'DB layer healthy: postgres + pgbouncer + mariadb'"]
 
   # ===========================================================================
-  # 2) STORAGE & CLOUD MOUNTS
-  # Handles raw file access, WebDAV bridges, and VFS caching.
+  # 2) STORAGE & SYNC
   # ===========================================================================
 
   nzbdav:
@@ -339,13 +336,12 @@ services:
 
   # ===========================================================================
   # 3) INDEXERS & DOWNLOADERS
-  # Fetching metadata and routing search queries.
   # ===========================================================================
 
   prowlarr:
     <<: *service-base
     container_name: prowlarr
-    image: ghcr.io/hotio/prowlarr:${PROWLARR_TAG:-latest}
+    image: lscr.io/linuxserver/prowlarr:${PROWLARR_TAG:-latest}
     profiles: [media]
     environment:
       <<: *common-env
@@ -364,15 +360,13 @@ services:
       test: ["CMD-SHELL", "curl -fsS http://localhost:9696/ >/dev/null || exit 1"]
 
   # ===========================================================================
-  # 4) MEDIA MANAGEMENT (The Arr Stack)
-  # Organizes files, monitors quality, and requests downloads.
+  # 4) MEDIA MANAGERS (ARRs)
   # ===========================================================================
 
   radarr:
     <<: *service-base
     container_name: radarr
-    image: ghcr.io/realzombee/radarr:develop
-#    image: lscr.io/linuxserver/radarr:${RADARR_TAG:-latest}
+    image: lscr.io/linuxserver/radarr:${RADARR_TAG:-latest}
     profiles: [media]
     environment:
       <<: *common-env
@@ -395,8 +389,7 @@ services:
   radarr-anime:
     <<: *service-base
     container_name: radarr-anime
-    image: ghcr.io/realzombee/radarr:develop
-#    image: lscr.io/linuxserver/radarr:${RADARR_ANIME_TAG:-latest}
+    image: lscr.io/linuxserver/radarr:${RADARR_ANIME_TAG:-latest}
     profiles: [media]
     environment:
       <<: *common-env
@@ -419,13 +412,10 @@ services:
   sonarr:
     <<: *service-base
     container_name: sonarr
-    image: ghcr.io/realzombee/sonarr:develop
-#    image: lscr.io/linuxserver/sonarr:${SONARR_TAG:-latest}
+    image: lscr.io/linuxserver/sonarr:${SONARR_TAG:-latest}
     profiles: [media]
     environment:
       <<: *common-env
-      ACCEPT_RELEASE_ANY_UPGRADABLE: true
-      FIX_ANIME_SEASON_SEARCH: true
       SONARR__POSTGRES__HOST: pgbouncer
       SONARR__POSTGRES__PORT: 5432
       SONARR__POSTGRES__USER: ${SONARR_DB_USER:-${MASTER_USER}}
@@ -445,8 +435,7 @@ services:
   sonarr-anime:
     <<: *service-base
     container_name: sonarr-anime
-    image: ghcr.io/realzombee/sonarr:develop
-#    image: lscr.io/linuxserver/sonarr:${SONARR_ANIME_TAG:-latest}
+    image: lscr.io/linuxserver/sonarr:${SONARR_ANIME_TAG:-latest}
     profiles: [media]
     environment:
       <<: *common-env
@@ -466,66 +455,108 @@ services:
       <<: *health-default
       test: ["CMD-SHELL", "curl -fsS http://localhost:8989/ >/dev/null || exit 1"]
 
-  lidarr:
+#  stash:
+#    <<: *service-base
+#    container_name: stash
+#    image: stashapp/stash:latest
+#    profiles: [media]
+#    environment:
+#      <<: *common-env
+#    ports:
+#      - "9999:9999"
+#    volumes:
+#      - /mnt/media/stash/data:/root/.stash
+#      - /mnt:/mnt:rslave
+#    healthcheck:
+#      <<: *health-default
+#      test: ["CMD-SHELL", "curl -fsS http://localhost:9999/ >/dev/null || exit 1"]
+
+#  bookshelf:
+#    <<: *service-base
+#    container_name: bookshelf
+#    image: ghcr.io/pennydreadful/bookshelf:hardcover
+#    profiles: [media]
+#    environment:
+#      <<: *common-env
+#      READARR__POSTGRES__HOST: pgbouncer
+#      READARR__POSTGRES__PORT: 5432
+#      READARR__POSTGRES__USER: ${READARR_DB_USER:-${MASTER_USER}}
+#      READARR__POSTGRES__PASSWORD: ${READARR_DB_PASSWORD:-${MASTER_PASSWORD}}
+#      READARR__POSTGRES__MAINDB: ${READARR_DB:-readarr_main}
+#      READARR__POSTGRES__LOGDB: ${READARR_LOG_DB:-readarr_log}
+#      READARR__POSTGRES__CACHEDB: ${READARR_CACHE_DB:-readarr_cache}
+#      READARR_API_KEY: ${READARR_API_KEY:-}
+#    ports:
+#      - "8787:8787"
+#    volumes:
+#      - /mnt/media/bookshelf/data:/config
+#      - /mnt:/mnt:rslave
+#    depends_on: *arr-dep
+#    healthcheck:
+#      <<: *health-default
+#      test: ["CMD-SHELL", "curl -fsS http://localhost:8787/ >/dev/null || exit 1"]
+
+# ===========================================================================
+# 4b) MUSIC DISCOVERY (SoulSync + slskd)
+# ===========================================================================
+
+  slskd:
     <<: *service-base
-    container_name: lidarr
-    image: ghcr.io/hotio/lidarr:${LIDARR_TAG:-latest}
+    container_name: slskd
+    image: slskd/slskd:latest
     profiles: [media]
     environment:
-      # Lidarr Database Config
       <<: *common-env
-      LIDARR__POSTGRES__HOST: pgbouncer
-      LIDARR__POSTGRES__PORT: 5432
-      LIDARR__POSTGRES__USER: ${LIDARR_DB_USER:-${MASTER_USER}}
-      LIDARR__POSTGRES__PASSWORD: ${LIDARR_DB_PASSWORD:-${MASTER_PASSWORD}}
-      LIDARR__POSTGRES__MAINDB: ${LIDARR_DB:-lidarr_main}
-      LIDARR__POSTGRES__LOGDB: ${LIDARR_LOG_DB:-lidarr_log}
-      LIDARR_API_KEY: ${LIDARR_API_KEY:-}
+      SLSKD_REMOTE_CONFIGURATION: "true"
+      SLSKD_HTTP_LISTEN_PORT: 5030
+      SLSKD_SLSK_LISTEN_PORT: 50300
+      SLSKD_SHARED_DIR: /shares/music
+      SLSKD_SLSK_USERNAME: ${SLSK_USER}
+      SLSKD_SLSK_PASSWORD: ${SLSK_PASS}
+      SLSKD_API_KEY: ${SLSKD_API_KEY}
     ports:
-      - "8686:8686"
+      - "5030:5030"
+      - "50300:50300"
     volumes:
-      - /mnt/media/lidarr/data:/config
-      - /mnt:/mnt:rslave
-    depends_on: *arr-dep
+      - /mnt/media/slskd:/app
+      - /mnt/media/slskd/downloads:/downloads
+      - /mnt/music-tank:/shares/music:ro
     healthcheck:
       <<: *health-default
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8686/ >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:5030/ || exit 1"]
 
-  bookshelf:
+  soulsync:
     <<: *service-base
-    container_name: bookshelf
-    image: ghcr.io/pennydreadful/bookshelf:hardcover
+    container_name: soulsync
+    image: boulderbadgedad/soulsync:latest
     profiles: [media]
     environment:
       <<: *common-env
-      READARR__POSTGRES__HOST: pgbouncer
-      READARR__POSTGRES__PORT: 5432
-      READARR__POSTGRES__USER: ${READARR_DB_USER:-${MASTER_USER}}
-      READARR__POSTGRES__PASSWORD: ${READARR_DB_PASSWORD:-${MASTER_PASSWORD}}
-      READARR__POSTGRES__MAINDB: ${READARR_DB:-readarr_main}
-      READARR__POSTGRES__LOGDB: ${READARR_LOG_DB:-readarr_log}
-      READARR__POSTGRES__CACHEDB: ${READARR_CACHE_DB:-readarr_cache}
-      READARR_API_KEY: ${READARR_API_KEY:-}
     ports:
-      - "8787:8787"
+      - "8008:8008"
+      - "8888:8888"
+      - "8889:8889"
     volumes:
-      - /mnt/media/bookshelf/data:/config
-      - /mnt:/mnt:rslave
-    depends_on: *arr-dep
+      - /mnt/media/soulsync/config:/app/config
+      - /mnt/media/soulsync/logs:/app/logs
+      - /mnt/media/soulsync/data:/app/data
+      - /mnt/media/slskd/downloads:/app/downloads
+      - /mnt/music-tank:/shares/music:ro
+    depends_on:
+      slskd:
+        condition: service_healthy
     healthcheck:
       <<: *health-default
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8787/ >/dev/null || exit 1"]
-
+      test: ["CMD-SHELL", "curl -f -s -m 5 http://localhost:8008/ || wget -q -O /dev/null -T 5 http://localhost:8008/ || exit 1"]
 
   # ===========================================================================
-  # 5) MEDIA REQUESTS & LIST SYNC
-  # Front-ends for fetching desired media into the Arr stack.
+  # 5) REQUESTS & STATS
   # ===========================================================================
 
   seerr:
     <<: *service-base
     container_name: seerr
-    image: ghcr.io/hotio/seerr:${JELLYSEERR_TAG:-latest}
+    image: ghcr.io/seerr-team/seerr:${JELLYSEERR_TAG:-latest}
     profiles: [media]
     environment:
       <<: *common-env
@@ -546,37 +577,36 @@ services:
       <<: *health-default
       test: ["CMD-SHELL", "wget --spider -q http://localhost:5055/api/v1/status || exit 1"]
 
-  cinesync:
+  jellystat:
     <<: *service-base
-    container_name: cinesync
-    image: sureshfizzy/cinesync:v3.2.2-alpha
+    container_name: jellystat
+    image: cyfershepard/jellystat:${JELLYSTAT_TAG:-latest}
     profiles: [media]
     environment:
       <<: *common-env
-      CINESYNC_PORT: 8082
-    ports:
-      - "8082:8082"
-    cap_add:
-      - SYS_ADMIN
-    security_opt:
-      - apparmor:unconfined
-    devices:
-      - /dev/fuse:/dev/fuse:rwm
+      POSTGRES_IP: pgbouncer
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${JELLYSTAT_DB:-jellystat}
+      POSTGRES_USER: ${JELLYSTAT_DB_USER:-jellystat}
+      POSTGRES_PASSWORD: ${JELLYSTAT_DB_PASSWORD:?JELLYSTAT_DB_PASSWORD must be set in .env}
+      JWT_SECRET: ${JELLYSTAT_JWT_SECRET:?JELLYSTAT_JWT_SECRET must be set in .env}
     volumes:
-      # Sureshfizzy's CineSync uses /app/db for database AND the .env file in newer versions.
-      - /mnt/media/cinesync/db:/app/db
-      - /mnt:/mnt:rshared
-    depends_on: *arr-dep
+      - /mnt/media/jellystat/backup-data:/app/backend/backup-data
+    ports:
+      - "3002:3000"
+    depends_on: *pgbouncer-dep
+    healthcheck:
+      <<: *health-default
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/ || exit 1"]
 
   # ===========================================================================
-  # 7) MEDIA SERVERS & REVERSE PROXY
-  # Edge-facing containers serving media and proxying web traffic.
+  # 6) MEDIA SERVERS / EDGE
   # ===========================================================================
 
   emby:
     <<: *service-base
     container_name: emby
-    image: lscr.io/linuxserver/emby:${EMBY_TAG:-latest}
+    image: emby/embyserver:${EMBY_TAG:-latest}
     profiles: [media]
     runtime: nvidia
     cpuset: "12-23,36-47"        # Node 1 — GPU (83:00.0) confirmed NUMA node 1
@@ -633,33 +663,9 @@ services:
       <<: *health-default
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:81/ >/dev/null || exit 1"]
 
-
   # ===========================================================================
-  # 8) OPERATIONS, STATS & MONITORING
-  # Keeping an eye on disk health, hardware utilization, and playback stats.
+  # 7) OPS / MONITORING
   # ===========================================================================
-
-  jellystat:
-    <<: *service-base
-    container_name: jellystat
-    image: cyfershepard/jellystat:${JELLYSTAT_TAG:-latest}
-    profiles: [media]
-    environment:
-      <<: *common-env
-      POSTGRES_IP: pgbouncer
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${JELLYSTAT_DB:-jellystat}
-      POSTGRES_USER: ${JELLYSTAT_DB_USER:-jellystat}
-      POSTGRES_PASSWORD: ${JELLYSTAT_DB_PASSWORD:?JELLYSTAT_DB_PASSWORD must be set in .env}
-      JWT_SECRET: ${JELLYSTAT_JWT_SECRET:?JELLYSTAT_JWT_SECRET must be set in .env}
-    volumes:
-      - /mnt/media/jellystat/backup-data:/app/backend/backup-data
-    ports:
-      - "3002:3000"
-    depends_on: *pgbouncer-dep
-    healthcheck:
-      <<: *health-default
-      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/ || exit 1"]
 
   scrutiny:
     <<: *service-base
@@ -726,9 +732,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /run/dbus:/run/dbus:ro
 
-  # ===========================================================================
-  # 9) MISC / STATIC WEBSERVER
-  # ===========================================================================
+# ===========================================================================
+# 8) STATIC WEBSERVER
+# ===========================================================================
 
   webserver:
     <<: *service-base

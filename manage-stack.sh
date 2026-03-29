@@ -30,6 +30,10 @@ EXTERNAL_NET="${EXTERNAL_NET:-media_network}"
 ZFS_POOLS=("media-tank" "music-tank")   # All pools to snapshot on up/down/update
 PROFILES=(--profile media --profile ops)
 
+# How many days to retain manual (non-Sanoid, non-Syncoid) snapshots.
+# Sanoid autosnap_ and syncoid_ snapshots are never touched by prune_manual_snapshots.
+MANUAL_SNAP_RETAIN_DAYS="${MANUAL_SNAP_RETAIN_DAYS:-7}"
+
 PGUSER="${MASTER_USER:-admin}"
 PGDATABASE="postgres"
 DISCORD_WEBHOOK="${DISCORD_WEBHOOK_URL:-}"
@@ -62,12 +66,51 @@ snapshot_zfs() {
     for pool in "${ZFS_POOLS[@]}"; do
       local snap="${pool}@${tag}-${ts}"
       echo -e "  ${CYAN}snapshot${NC}: $snap"
-      zfs snapshot -r "$snap" 2>/dev/null || echo -e "  ${YELLOW}warning${NC}: snapshot failed for $pool (check permissions)"
+      sudo zfs snapshot -r "$snap" 2>/dev/null || echo -e "  ${YELLOW}warning${NC}: snapshot failed for $pool (check permissions)"
     done
   fi
 }
 
-pause() {
+# ------------------------------------------------------------------------------
+# prune_manual_snapshots — destroy manual snapshots older than MANUAL_SNAP_RETAIN_DAYS
+#
+# Never touches:
+#   - autosnap_* (Sanoid-managed)
+#   - *syncoid*  (Syncoid incremental base — destroying these forces a full resend)
+#
+# Uses `zfs list -p` for parseable Unix epoch creation timestamps so date math
+# is reliable regardless of locale or date format.
+# ------------------------------------------------------------------------------
+prune_manual_snapshots() {
+  if ! command -v zfs >/dev/null 2>&1; then return; fi
+
+  local days="${1:-$MANUAL_SNAP_RETAIN_DAYS}"
+  local cutoff
+  cutoff=$(( $(date +%s) - days * 86400 ))
+  local pruned=0
+
+  echo -e "  ${CYAN}pruning${NC}: manual snapshots older than ${days} days..."
+
+  while IFS=$'\t' read -r name creation; do
+    # Never touch Sanoid autosnaps or Syncoid incremental bases
+    [[ "$name" == *autosnap_* ]] && continue
+    [[ "$name" == *syncoid*   ]] && continue
+
+    if (( creation < cutoff )); then
+      echo -e "  ${YELLOW}destroy${NC}: $name"
+      sudo zfs destroy "$name" 2>/dev/null || echo -e "  ${YELLOW}warning${NC}: could not destroy $name"
+      (( pruned++ )) || true
+    fi
+  done < <(zfs list -H -t snapshot -o name,creation -p 2>/dev/null)
+
+  if (( pruned == 0 )); then
+    echo -e "  ${GREEN}no manual snapshots older than ${days} days found.${NC}"
+  else
+    echo -e "  ${GREEN}pruned ${pruned} snapshot(s).${NC}"
+  fi
+}
+
+wait_for_keypress() {
   echo -e "\nPress any key to return to menu..."
   read -r -n 1 -s
 }
@@ -86,8 +129,8 @@ action_up_all() {
   snapshot_zfs "pre-up"
   echo -e "\n${GREEN}Starting stack${NC}: $PROJECT_NAME"
   dc up -d
-  header "Post-Up Snapshots"
-  snapshot_zfs "post-up"
+  header "Pruning old manual snapshots"
+  prune_manual_snapshots
 }
 
 action_down_all() {
@@ -95,6 +138,8 @@ action_down_all() {
   snapshot_zfs "pre-down"
   echo -e "\n${RED}Stopping stack${NC}: $PROJECT_NAME"
   dc down
+  header "Pruning old manual snapshots"
+  prune_manual_snapshots
 }
 
 action_update() {
@@ -104,8 +149,8 @@ action_update() {
   dc pull
   echo -e "${CYAN}Recreating changed containers...${NC}"
   dc up -d --remove-orphans
-  header "Post-Update Snapshots"
-  snapshot_zfs "post-update"
+  header "Pruning old manual snapshots"
+  prune_manual_snapshots
   echo -e "\n${GREEN}Update complete.${NC} Checking health..."
   sleep 5
   action_health_check
@@ -253,11 +298,15 @@ action_backup_status() {
     fi
   done
 
-  header "Snapshot Counts"
+  header "Snapshot Counts (autosnap / manual / syncoid)"
   for pool in media-tank music-tank backup-tank; do
-    local count
-    count=$(zfs list -t snapshot -r "$pool" -H 2>/dev/null | wc -l)
-    printf "  %-15s %s snapshots\n" "$pool:" "$count"
+    local total autosnap manual syncoid
+    total=$(zfs list -t snapshot -r "$pool" -H 2>/dev/null | wc -l)
+    autosnap=$(zfs list -t snapshot -r "$pool" -H -o name 2>/dev/null | grep -c 'autosnap_' || true)
+    syncoid=$(zfs list -t snapshot -r "$pool" -H -o name 2>/dev/null | grep -c 'syncoid' || true)
+    manual=$(( total - autosnap - syncoid ))
+    printf "  %-15s total: %-5s  autosnap: %-5s  syncoid: %-5s  manual: %s\n" \
+      "$pool:" "$total" "$autosnap" "$syncoid" "$manual"
   done
 
   header "Snapshot Space Usage"
@@ -297,19 +346,33 @@ action_logs_all() {
 }
 
 action_rollback() {
-  header "Available Pre-Update Snapshots"
-  local snaps=()
-  mapfile -t snaps < <(zfs list -t snapshot -o name,creation -s creation -r media-tank 2>/dev/null | \
-    grep 'pre-update\|pre-up' | tail -10)
+  # Build the candidate list across ALL managed pools, not just media-tank.
+  # Snapshots that share a timestamp across pools are grouped so rolling back
+  # one is rolling back all — keeping the pools consistent with each other.
+  header "Available Pre-Update/Pre-Up Snapshots (all pools)"
 
-  if [[ ${#snaps[@]} -eq 0 ]]; then
-    echo "  No pre-update snapshots found."
+  declare -A snap_times   # tag-timestamp -> "pool1 pool2 ..."
+  for pool in "${ZFS_POOLS[@]}"; do
+    while IFS=$'\t' read -r name _creation; do
+      # Strip pool prefix to get the snapshot tag (e.g. pre-up-20260316-182306)
+      local tag="${name##*@}"
+      snap_times["$tag"]+="$pool "
+    done < <(zfs list -H -t snapshot -o name,creation -s creation -r "$pool" 2>/dev/null | \
+               grep -E '@(pre-update|pre-up)' | tail -10)
+  done
+
+  if [[ ${#snap_times[@]} -eq 0 ]]; then
+    echo "  No pre-update or pre-up snapshots found."
     return
   fi
 
+  # Display sorted list
+  local -a tags
+  mapfile -t tags < <(printf '%s\n' "${!snap_times[@]}" | sort)
+
   local i=1
-  for snap in "${snaps[@]}"; do
-    printf "  [%2d] %s\n" "$i" "$snap"
+  for tag in "${tags[@]}"; do
+    printf "  [%2d] %s  (pools: %s)\n" "$i" "$tag" "${snap_times[$tag]}"
     ((i++))
   done
   echo "  [b]  Back"
@@ -318,22 +381,25 @@ action_rollback() {
 
   [[ "${snap_choice,,}" == "b" ]] && return
 
-  if ! [[ "$snap_choice" =~ ^[0-9]+$ ]] || (( snap_choice < 1 || snap_choice > ${#snaps[@]} )); then
+  if ! [[ "$snap_choice" =~ ^[0-9]+$ ]] || (( snap_choice < 1 || snap_choice > ${#tags[@]} )); then
     echo "Invalid selection."; return
   fi
 
-  local selected_line="${snaps[$((snap_choice - 1))]}"
-  local selected_snap
-  selected_snap=$(echo "$selected_line" | awk '{print $1}')
+  local selected_tag="${tags[$((snap_choice - 1))]}"
+  local affected_pools="${snap_times[$selected_tag]}"
 
-  echo -e "\n${RED}WARNING: This will rollback media-tank to: $selected_snap${NC}"
+  echo -e "\n${RED}WARNING: This will rollback the following pools to snapshot tag: $selected_tag${NC}"
+  echo -e "  Pools: ${affected_pools}"
   echo "This is destructive — all data written after this snapshot will be lost."
   read -r -p "Type 'ROLLBACK' to confirm: " confirm
   if [[ "$confirm" == "ROLLBACK" ]]; then
     echo "Stopping stack..."
     dc down
-    echo "Rolling back..."
-    zfs rollback -r "$selected_snap" || { echo -e "${RED}Rollback failed.${NC}"; return; }
+    for pool in $affected_pools; do
+      local snap="${pool}@${selected_tag}"
+      echo "Rolling back $snap ..."
+      sudo zfs rollback -r "$snap" || { echo -e "${RED}Rollback failed for $snap.${NC}"; return; }
+    done
     echo -e "${GREEN}Rollback complete.${NC} Restarting stack..."
     action_up_all
   else
@@ -366,6 +432,7 @@ gui_menu() {
     echo ""
     echo -e " ${BOLD}Recovery${NC}"
     echo " [R] Rollback to snapshot"
+    echo " [P] Prune manual snapshots now"
     echo ""
     echo " [0] Exit"
     echo -e "${BOLD}================================================================${NC}"
@@ -393,6 +460,7 @@ gui_menu() {
       p) action_pg_shell ;;
       s) action_db_status ;;
       R) action_rollback ;;
+      P) prune_manual_snapshots ;;
       0)
         echo "Exiting..."
         break
@@ -400,7 +468,7 @@ gui_menu() {
       *) echo "Invalid option." ;;
     esac
 
-    pause
+    wait_for_keypress
   done
 
   clear
@@ -412,7 +480,7 @@ gui_manage_single() {
 
   if [[ ${#services[@]} -eq 0 ]]; then
     echo "No services found. Is docker-compose.yml valid?"
-    pause
+    wait_for_keypress
     return
   fi
 
@@ -436,12 +504,12 @@ gui_manage_single() {
   [[ "${svc_choice,,}" == "b" ]] && return
 
   if ! [[ "$svc_choice" =~ ^[0-9]+$ ]]; then
-    echo "Invalid input. Please enter a number."; pause; return
+    echo "Invalid input. Please enter a number."; wait_for_keypress; return
   fi
 
   local idx=$(( svc_choice - 1 ))
   if (( idx < 0 || idx >= ${#services[@]} )); then
-    echo "Invalid selection."; pause; return
+    echo "Invalid selection."; wait_for_keypress; return
   fi
 
   local selected="${services[$idx]}"
@@ -462,7 +530,7 @@ gui_manage_single() {
     *) echo "Invalid." ;;
   esac
 
-  pause
+  wait_for_keypress
 }
 
 action_inspect_service() {
@@ -515,6 +583,7 @@ main() {
     db)         action_db_status ;;
     checkpoint) action_checkpoint ;;
     prune)      action_prune ;;
+    prune-snaps) prune_manual_snapshots "${1:-}" ;;
     report)     action_generate_report ;;
     logs)       action_logs_all ;;
     validate)   dc config -q && echo "Config valid." ;;
@@ -522,23 +591,24 @@ main() {
       echo "Usage: $(basename "$0") [command]"
       echo ""
       echo "Commands:"
-      echo "  gui          Interactive TUI (default)"
-      echo "  up           Start full stack"
-      echo "  down         Stop full stack"
-      echo "  restart      Stop + start full stack"
-      echo "  update       Pull images + recreate"
-      echo "  status       Show containers"
-      echo "  health       Health check all containers"
-      echo "  disk         ZFS & disk report"
-      echo "  backup       Backup & snapshot status"
-      echo "  network      Port bindings & Docker network"
-      echo "  db           Database status & sizes"
-      echo "  checkpoint   Postgres CHECKPOINT"
-      echo "  prune        Clean stopped containers/images"
-      echo "  report       Generate system report"
-      echo "  logs         Tail all container logs"
-      echo "  validate     Validate compose config"
-      echo "  help         Show this help"
+      echo "  gui             Interactive TUI (default)"
+      echo "  up              Start full stack"
+      echo "  down            Stop full stack"
+      echo "  restart         Stop + start full stack"
+      echo "  update          Pull images + recreate"
+      echo "  status          Show containers"
+      echo "  health          Health check all containers"
+      echo "  disk            ZFS & disk report"
+      echo "  backup          Backup & snapshot status"
+      echo "  network         Port bindings & Docker network"
+      echo "  db              Database status & sizes"
+      echo "  checkpoint      Postgres CHECKPOINT"
+      echo "  prune           Clean stopped containers/images"
+      echo "  prune-snaps [N] Destroy manual snapshots older than N days (default: $MANUAL_SNAP_RETAIN_DAYS)"
+      echo "  report          Generate system report"
+      echo "  logs            Tail all container logs"
+      echo "  validate        Validate compose config"
+      echo "  help            Show this help"
       ;;
     *)          gui_menu ;;
   esac
